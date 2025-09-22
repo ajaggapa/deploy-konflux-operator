@@ -4,8 +4,8 @@
 # This script automates the complete installation process for telco operators:
 # sriov, metallb, nmstate, ptp
 
-set -euo pipefail
-set -x
+set -Eeuo pipefail
+set +x
 
 # Function to display usage
 usage() {
@@ -123,49 +123,45 @@ set_operator_config() {
     CATALOG_NAME="${OPERATOR}-konflux"
     LOCAL_REGISTRY="$INTERNAL_REGISTRY"
     AUTHFILE="$INTERNAL_REGISTRY_AUTH"
-    KUBECONFIG="/home/kni/clusterconfigs/auth/kubeconfig"
 }
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Logging functions
+# Minimal logging functions
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo "[INFO] $1"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    echo "[SUCCESS] $1"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo "[WARNING] $1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
+    echo "[ERROR] $1" >&2
 }
 
 # Dry-run helpers
 show_command() {
-    echo -e "${YELLOW}[DRY-RUN COMMAND]${NC} $1"
+    echo "[DRY-RUN] Command to be executed:"
+    echo "===================================================================================="
+    echo "  $1"
+    echo "===================================================================================="
 }
 
 show_yaml() {
     local yaml_file="$1"
     local description="$2"
-    echo -e "${BLUE}[DRY-RUN YAML]${NC} $description"
-    echo "------- File: $yaml_file -------"
+    echo "[DRY-RUN] $description"
+    echo "===================================================================================="
     if [[ -f "$yaml_file" ]]; then
-        cat "$yaml_file"
+        # Indent YAML content for better visibility
+        sed 's/^/  /' "$yaml_file"
     else
-        echo "File not found: $yaml_file"
+        echo "  File not found: $yaml_file"
     fi
-    echo "------- End of File -------"
+    echo "===================================================================================="
     echo
 }
 
@@ -173,99 +169,59 @@ show_yaml() {
 check_prerequisites() {
     log_info "Checking prerequisites..."
     
-    # Check if required files exist
-    if [[ ! -f "$AUTHFILE" ]]; then
-        log_error "Auth file not found: $AUTHFILE"
-        exit 1
-    fi
-    
-    if [[ ! -f "$KUBECONFIG" ]]; then
-        log_error "Kubeconfig not found: $KUBECONFIG"
-        exit 1
-    fi
-    
-    # Check required commands
-    local required_commands=("oc" "opm" "jq")
+    # Check required commands with helpful error messages
+    local required_commands=("oc" "opm" "jq" "curl")
     for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            log_error "Required command not found: $cmd"
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            case "$cmd" in
+                oc) log_error "OpenShift CLI (oc) is not installed. Please install oc and try again." ;;
+                opm) log_error "OPM CLI (opm) is not installed. Please install opm and try again." ;;
+                jq) log_error "jq is not installed. Please install jq (for JSON parsing) and try again." ;;
+                *) log_error "Required command not found: $cmd" ;;
+            esac
             exit 1
         fi
     done
     
-    # Export kubeconfig
-    export KUBECONFIG="$KUBECONFIG"
-    
-    # Test cluster connectivity
-    if ! oc cluster-info &> /dev/null; then
-        log_error "Cannot connect to OpenShift cluster"
+    # Check if required files exist
+    if [[ ! -f "$AUTHFILE" ]]; then
+        log_error "Auth file not found: $AUTHFILE. Please ensure the file exists and is readable."
         exit 1
     fi
     
+    # Test cluster connectivity
+    if ! oc cluster-info &> /dev/null; then
+        log_error "Cannot connect to OpenShift cluster. Ensure you are logged in (oc login) and have administrative privileges."
+        exit 1
+    fi
+      
     log_success "Prerequisites check passed"
 }
 
 cleanup_existing_resources() {
+    log_info "Step 0: Cleaning up existing resources..."
+    
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "Step 0: [DRY-RUN] Would clean up existing resources..."
         show_command "oc delete namespace \"$OPERATOR_NAMESPACE\" --ignore-not-found"
         show_command "oc delete catalogsource \"$CATALOG_NAME\" -n openshift-marketplace --ignore-not-found"
-        log_info "[DRY-RUN] Would ensure clean installation by removing existing operator resources"
         return 0
     fi
     
-    log_info "Step 0: Cleaning up existing resources for clean installation..."
+    # Delete existing resources
+    oc delete namespace "$OPERATOR_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+    oc delete catalogsource "$CATALOG_NAME" -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
     
-    # Delete existing operator namespace
-    log_info "Removing existing operator namespace: $OPERATOR_NAMESPACE"
-    if oc get namespace "$OPERATOR_NAMESPACE" >/dev/null 2>&1; then
-        log_info "Found existing namespace $OPERATOR_NAMESPACE, deleting..."
-        oc delete namespace "$OPERATOR_NAMESPACE" --ignore-not-found
-        
-        # Wait for namespace deletion to complete
-        log_info "Waiting for namespace deletion to complete..."
-        local wait_count=0
-        while oc get namespace "$OPERATOR_NAMESPACE" >/dev/null 2>&1 && [[ $wait_count -lt 30 ]]; do
-            sleep 2
-            ((++wait_count))
-        done
-        
-        if [[ $wait_count -eq 30 ]]; then
-            log_warning "Namespace deletion is taking longer than expected, continuing anyway..."
-        else
-            log_success "Namespace $OPERATOR_NAMESPACE deleted successfully"
-        fi
-    else
-        log_info "Namespace $OPERATOR_NAMESPACE does not exist, skipping..."
-    fi
-    
-    # Delete existing catalog source
-    log_info "Removing existing catalog source: $CATALOG_NAME"
-    if oc get catalogsource "$CATALOG_NAME" -n openshift-marketplace >/dev/null 2>&1; then
-        log_info "Found existing catalog source $CATALOG_NAME, deleting..."
-        oc delete catalogsource "$CATALOG_NAME" -n openshift-marketplace --ignore-not-found
-        log_success "Catalog source $CATALOG_NAME deleted successfully"
-    else
-        log_info "Catalog source $CATALOG_NAME does not exist, skipping..."
-    fi
-    
-    # Wait a moment for resources to be fully cleaned up
-    sleep 2
     log_success "Resource cleanup completed"
 }
 
 # Step 1: Mirror FBC image to local registry
 mirror_fbc_image() {
-    log_info "Step 1: Mirroring FBC image to local registry..."
+    log_info "Step 1: Mirroring FBC image..."
     
     local fbc_target_image="${LOCAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
     
-    log_info "Source: $FBC_SOURCE_IMAGE"
-    log_info "Target: $fbc_target_image"
-    
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         show_command "oc image mirror -a=\"$QUAY_AUTH\" --keep-manifest-list=true \"$FBC_SOURCE_IMAGE\" \"$fbc_target_image\""
-        log_info "[DRY-RUN] Would mirror FBC image to: $fbc_target_image"
         echo "$fbc_target_image" > /tmp/fbc_image_url
     else
         if oc image mirror \
@@ -281,9 +237,9 @@ mirror_fbc_image() {
     fi
 }
 
-# Step 2: Extract related images digests and install modes using opm render
-extract_related_images() {
-    log_info "Step 2: Extracting related images using opm render..."
+# Step 2: Extract operator metadata (images, channel, install mode) using opm render
+extract_operator_metadata() {
+    log_info "Step 2: Extracting operator metadata using opm render..."
     
     local temp_render_output="/tmp/opm_render_output.json"
     local channel_file="/tmp/${OPERATOR}_default_channel.txt"
@@ -292,7 +248,7 @@ extract_related_images() {
     # Use opm render to get the catalog content with quay auth (run even in dry-run to get real data)
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         show_command "REGISTRY_AUTH_FILE=\"$QUAY_AUTH\" opm render \"$FBC_SOURCE_IMAGE\" > \"$temp_render_output\""
-        log_info "[DRY-RUN] Extracting catalog content from FBC image to populate YAMLs with real data..."
+        log_info "[DRY-RUN] Extracting operator metadata from FBC image to populate YAMLs with real data..."
     fi
     
     if REGISTRY_AUTH_FILE="$QUAY_AUTH" opm render "$FBC_SOURCE_IMAGE" > "$temp_render_output"; then
@@ -303,7 +259,7 @@ extract_related_images() {
     fi
     
     # Extract relatedImages, repositories, and metadata
-    log_info "Extracting related images and repositories from relatedImages..."
+    log_info "Parsing operator metadata from catalog content..."
     
     local related_images_file="/tmp/${OPERATOR}_related_images.txt"
     local repositories_file="/tmp/${OPERATOR}_repositories.txt"
@@ -388,61 +344,43 @@ extract_related_images() {
     local default_channel=$(cat "$channel_file" 2>/dev/null || echo "")
     local install_mode=$(cat "$install_mode_file" 2>/dev/null || echo "OwnNamespace")
     
-    log_success "Extracted $images_count related images and $repos_count unique repositories"
-    
     if [[ $images_count -eq 0 ]]; then
         log_error "No related images found"
         exit 1
     fi
     
-    if [[ -n "$default_channel" ]]; then
-        log_success "Extracted default channel: $default_channel"
-    else
-        log_warning "Could not extract defaultChannel, using fallback: stable"
+    if [[ -z "$default_channel" ]]; then
         echo "stable" > "$channel_file"
+        default_channel="stable"
     fi
     
-    log_success "Extracted install mode: $install_mode"
+    # Display extracted metadata (including in dry-run mode)
+    log_info "Extracted operator metadata:"
+    log_info "  - Default Channel: $default_channel"
+    log_info "  - Install Mode: $install_mode"
+    log_info "  - Related Images: $images_count"
+    log_info "  - Repository Mappings: $repos_count"
     
-    # Display first few images and repositories for verification
-    log_info "Sample related images:"
-    head -3 "$related_images_file" | while read -r image; do
-        echo "  $image"
-    done
-    
-    log_info "Sample repositories for IDMS:"
-    head -3 "$repositories_file" | while read -r repo; do
-        echo "  $repo"
-    done
+    log_success "Operator metadata extraction completed successfully"
 }
 
 # Step 3: Mirror related images to local registry
 mirror_related_images() {
-    log_info "Step 3: Mirroring related images to local registry..."
+    log_info "Step 3: Mirroring related images..."
     
     local related_images_file="/tmp/${OPERATOR}_related_images.txt"
     local mapping_file="/tmp/${OPERATOR}_image_mappings.txt"
     
-    # Clear mapping file
     > "$mapping_file"
     
-    # Mirror each related image to local registry
     local success_count=0
     local total_count=$(wc -l < "$related_images_file")
     
-    local image_counter=0
-    
     while IFS= read -r image || [[ -n "$image" ]]; do
-        ((++image_counter))
         [[ -z "$image" ]] && continue
         
-        # Extract digest from the image
         local digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}' || echo "")
-        
-        if [[ -z "$digest" ]]; then
-            log_warning "Skipping image without digest: $image"
-            continue
-        fi
+        [[ -z "$digest" ]] && continue
         
         local source_image="${ART_IMAGES_SOURCE}@${digest}"
         local target_image="${LOCAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
@@ -452,23 +390,19 @@ mirror_related_images() {
             show_command "oc image mirror -a=\"$QUAY_AUTH\" --keep-manifest-list=true \"$source_image\" \"$target_image\""
             ((++success_count))
         else
-            log_info "Mirroring: $source_image"
             if oc image mirror \
                 -a="$QUAY_AUTH" \
                 --keep-manifest-list=true \
-                "$source_image" "$target_image" </dev/null 2>/dev/null;
-            then
+                "$source_image" "$target_image" </dev/null 2>/dev/null; then
                 ((++success_count))
             else
-                log_error "Failed to mirror: $source_image"
-                log_error "Image mirroring failed. Exiting..."
+                log_error "Failed to mirror image: $source_image"
                 exit 1
             fi
         fi
     done < "$related_images_file"
     
     log_success "Successfully mirrored $success_count/$total_count images"
-    log_info "Created mapping file with $(wc -l < "$mapping_file") image mappings"
 }
 
 # Step 4: Create and apply ImageDigestMirrorSet
@@ -510,23 +444,9 @@ EOF
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         show_yaml "$idms_yaml" "ImageDigestMirrorSet that would be applied"
         show_command "oc apply -f \"$idms_yaml\""
-        show_command "oc get imagedigestmirrorset \"${OPERATOR}-quay-idms\""
-        log_info "[DRY-RUN] Would create ImageDigestMirrorSet: ${OPERATOR}-quay-idms"
     else
-        log_info "Applying ImageDigestMirrorSet..."
         if oc apply -f "$idms_yaml"; then
             log_success "ImageDigestMirrorSet created successfully"
-            
-            # Wait a moment for the IDMS to be processed
-            log_info "Waiting for ImageDigestMirrorSet to be processed..."
-            sleep 5
-            
-            # Check IDMS status
-            if oc get imagedigestmirrorset "${OPERATOR}-quay-idms" &> /dev/null; then
-                log_success "ImageDigestMirrorSet is active"
-            else
-                log_warning "ImageDigestMirrorSet may not be fully processed yet"
-            fi
         else
             log_error "Failed to create ImageDigestMirrorSet"
             exit 1
@@ -538,110 +458,55 @@ EOF
 wait_for_mcp_update() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         log_info "Step 5: [DRY-RUN] Would wait for MachineConfigPool updates..."
-        show_command "oc get mcp"
-        show_command "oc get mcp -o jsonpath='{.items[*].status.conditions[?(@.type==\"Updating\")].status}'"
-        log_info "[DRY-RUN] Would wait for cluster nodes to start updating after IDMS application"
-        log_info "[DRY-RUN] Would wait up to 5 minutes for MCP Updating status to become 'True'"
-        log_info "[DRY-RUN] Would then wait for MCP Updating status to become 'False'"
-        log_info "[DRY-RUN] Would wait an additional 10 minutes for cluster to stabilize"
+        show_command "oc wait --for=condition=Updating mcp --all --timeout=300s"
+        show_command "oc wait --for=condition=Updating=false mcp --all --timeout=600s"
         return 0
     fi
     
-    log_info "Step 5: Waiting for MachineConfigPool updates after IDMS..."
+    log_info "Step 5: Waiting for MachineConfigPool updates..."
     
-    # First, wait for at least one MCP to start updating
-    log_info "Waiting for cluster to start updating (MCP Updating=True)..."
-    local max_wait_for_start=60  # 1 minute
-    local wait_time=0
-    local updating_started=false
+    # Wait for MCP updates (best effort)
+    oc wait --for=condition=Updating mcp --all --timeout=300s >/dev/null 2>&1 || true
+    oc wait --for=condition=Updating=false mcp --all --timeout=600s >/dev/null 2>&1 || true
     
-    while [[ $wait_time -lt $max_wait_for_start ]]; do
-        # Check if any MCP is updating
-        local updating_status=$(oc get mcp -o jsonpath='{.items[*].status.conditions[?(@.type=="Updating")].status}' 2>/dev/null || echo "")
-        
-        if [[ "$updating_status" == *"True"* ]]; then
-            log_success "Cluster has started updating (MCP Updating=True detected)"
-            updating_started=true
-            break
-        fi
-        
-        log_info "Waiting for MCP updates to start... (${wait_time}s/${max_wait_for_start}s)"
-        oc get mcp --no-headers 2>/dev/null || log_warning "Unable to get MCP status"
-        sleep 15
-        ((wait_time+=15))
-    done
-    
-    if [[ "$updating_started" == "false" ]]; then
-        log_warning "MCP updates did not start within ${max_wait_for_start} seconds"
-        log_info "Current MCP status:"
-        oc get mcp || true
-        log_info "Proceeding anyway - IDMS may not require node updates"
-        return 0
-    fi
-    
-    # Now wait for all MCPs to finish updating
-    log_info "Waiting for all MachineConfigPools to finish updating (MCP Updating=False)..."
-    local max_wait_for_complete=600  # 10 minutes
-    wait_time=0
-    
-    while [[ $wait_time -lt $max_wait_for_complete ]]; do
-        local all_updated=true
-        local mcp_status=""
-        
-        # Get status of all MCPs
-        if mcp_status=$(oc get mcp -o jsonpath='{range .items[*]}{.metadata.name}:{.status.conditions[?(@.type=="Updating")].status},{end}' 2>/dev/null); then
-            log_info "MCP Update Status: $mcp_status"
-            
-            # Check if any MCP is still updating
-            if [[ "$mcp_status" == *"True"* ]]; then
-                all_updated=false
-            fi
-        else
-            log_warning "Unable to get MCP status, retrying..."
-            all_updated=false
-        fi
-        
-        if [[ "$all_updated" == "true" ]]; then
-            log_success "All MachineConfigPools have finished updating"
-            break
-        fi
-        
-        log_info "MCPs still updating... waiting (${wait_time}s/${max_wait_for_complete}s)"
-        sleep 30
-        ((wait_time+=30))
-    done
-    
-    if [[ $wait_time -ge $max_wait_for_complete ]]; then
-        log_warning "MCP updates did not complete within ${max_wait_for_complete} seconds"
-        log_info "Current MCP status:"
-        oc get mcp || true
-        log_info "Proceeding anyway - continuing with operator installation"
-        return 0
-    fi
-    
-    log_success "MachineConfigPool updates completed and cluster stabilized"
-    
-    # Final status check
-    log_info "Final MCP status:"
-    oc get mcp || true
+    log_success "MachineConfigPool update process completed"
 }
 
 # Step 6: Apply CatalogSource YAML
 apply_catalog_source() {
     log_info "Step 6: Creating CatalogSource..."
     
-    local fbc_image_url=$(cat /tmp/fbc_image_url)
+    # Get FBC image URL - handle both dry-run and real execution
+    local fbc_image_url
+    if [[ -f "/tmp/fbc_image_url" ]]; then
+        fbc_image_url=$(cat /tmp/fbc_image_url)
+    else
+        # Fallback for dry-run mode if file doesn't exist
+        fbc_image_url="${LOCAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
+    fi
+    
+    # Create proper operator display name (avoid ${OPERATOR^} syntax issues)
+    local operator_display_name
+    case "$OPERATOR" in
+        sriov) operator_display_name="SRIOV" ;;
+        metallb) operator_display_name="MetalLB" ;;
+        nmstate) operator_display_name="NMState" ;;
+        ptp) operator_display_name="PTP" ;;
+        *) operator_display_name="$(echo "$OPERATOR" | sed 's/^./\U&/')" ;;
+    esac
+    
     local catalog_yaml="/tmp/${OPERATOR}_catalog_source.yaml"
     
+    # Generate YAML with properly substituted variables
     cat > "$catalog_yaml" <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
 metadata:
-  name: $CATALOG_NAME
+  name: ${CATALOG_NAME}
   namespace: openshift-marketplace
 spec:
-  displayName: ${OPERATOR^} Konflux Catalog
-  image: $fbc_image_url
+  displayName: ${operator_display_name} Konflux Catalog
+  image: ${fbc_image_url}
   sourceType: grpc
   updateStrategy:
     registryPoll:
@@ -651,9 +516,7 @@ EOF
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         show_yaml "$catalog_yaml" "CatalogSource that would be applied"
         show_command "oc apply -f \"$catalog_yaml\""
-        log_info "[DRY-RUN] Would create CatalogSource: $CATALOG_NAME"
     else
-        log_info "Applying CatalogSource YAML..."
         if oc apply -f "$catalog_yaml"; then
             log_success "CatalogSource created successfully"
         else
@@ -928,98 +791,29 @@ monitor_subscription_health() {
 
 wait_for_csv() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "Step 11: [DRY-RUN] Would monitor subscription health..."
-        show_command "monitor_subscription_health \"${OPERATOR_NAME}\" \"$OPERATOR_NAMESPACE\" 180"
-        log_info "Step 12: [DRY-RUN] Would wait for CSV resource creation..."
-        show_command "oc get subscription \"${OPERATOR_NAME}\" -n \"$OPERATOR_NAMESPACE\" -o jsonpath='{.status.currentCSV}'"
-        show_command "oc wait --for=jsonpath='{.status.phase}'=Succeeded \"csv/\$CURRENT_CSV\" -n \"$OPERATOR_NAMESPACE\" --timeout=180s"
-        show_command "oc get csv -n \"$OPERATOR_NAMESPACE\""
-        show_command "oc get pods -n \"$OPERATOR_NAMESPACE\""
-        log_info "[DRY-RUN] Would wait for ${OPERATOR^} operator CSV to reach Succeeded phase"
+        log_info "Step 11: [DRY-RUN] Would wait for CSV installation..."
+        show_command "oc wait --for=jsonpath='{.status.phase}'=Succeeded csv --all -n \"$OPERATOR_NAMESPACE\" --timeout=180s"
         return 0
     fi
     
-    # Step 11: Monitor subscription health before proceeding to CSV
-    log_info "Step 11: Monitoring subscription health and resolving any issues..."
+    log_info "Step 11: Waiting for CSV installation..."
+    
+    # Monitor subscription health and wait for CSV
     if ! monitor_subscription_health "${OPERATOR_NAME}" "$OPERATOR_NAMESPACE" 180; then
-        log_error "Subscription failed to become healthy. Checking current state for diagnostics..."
-        log_info "Subscription details:"
-        oc get subscription "${OPERATOR_NAME}" -n "$OPERATOR_NAMESPACE" -o yaml
-        log_info "Catalog sources:"
-        oc get catalogsource -n openshift-marketplace
-        log_info "Package manifests:"
-        oc get packagemanifest -n openshift-marketplace | grep "${OPERATOR}" || true
+        log_error "Subscription failed to become healthy"
         exit 1
     fi
 
-    # Step 12: Wait for CSV creation and success
-    log_info "Step 12: Waiting for operator CSV to be installed and running..."
-
-    # Get the current CSV from the subscription (it should be set now)
-    local current_csv=$(oc get subscription "${OPERATOR_NAME}" -n "$OPERATOR_NAMESPACE" -o jsonpath='{.status.currentCSV}' 2>/dev/null || echo "")
-
-    if [ -n "${current_csv}" ]; then
-        log_info "Subscription resolved to CSV: ${current_csv}"
-        log_info "Waiting for CSV ${current_csv} to reach Succeeded state..."
-        
-        if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded "csv/${current_csv}" -n "$OPERATOR_NAMESPACE" --timeout=180s; then
-            log_warning "CSV ${current_csv} did not reach 'Succeeded' phase in time."
-            log_info "CSV status:"
-            oc get csv "${current_csv}" -n "$OPERATOR_NAMESPACE" -o yaml | grep -A 30 "status:" || true
-            log_info "Checking for installation issues..."
-        else
-            log_success "CSV ${current_csv} successfully reached Succeeded state!"
-        fi
+    # Wait for CSV to reach Succeeded state
+    if oc wait --for=jsonpath='{.status.phase}'=Succeeded csv --all -n "$OPERATOR_NAMESPACE" --timeout=180s; then
+        log_success "CSV installation completed successfully"
     else
-        log_warning "No currentCSV found in subscription. Falling back to detecting any new CSV..."
-        
-        # Fallback: Wait for any CSV to reach Succeeded state
-        log_info "Waiting for any CSV in namespace to reach Succeeded state..."
-        if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded csv --all -n "$OPERATOR_NAMESPACE" --timeout=120s; then
-            log_warning "No CSV reached 'Succeeded' phase in time. Check 'oc get csv -n $OPERATOR_NAMESPACE'."
-        fi
+        log_warning "CSV did not reach Succeeded state in time"
     fi
-    
-    # Step 13: Final verification and status reporting
-    log_info "Step 13: Final verification and status reporting..."
-    echo
-    log_info "Current CSV status:"
-    oc get csv -n "$OPERATOR_NAMESPACE"
-    echo
-    
-    log_info "Current operator pods:"
-    oc get pods -n "$OPERATOR_NAMESPACE" 2>/dev/null || echo "No pods found in $OPERATOR_NAMESPACE"
-    echo
-    
-    log_info "Subscription status:"
-    oc get subscription "${OPERATOR_NAME}" -n "$OPERATOR_NAMESPACE" -o custom-columns="NAME:.metadata.name,PACKAGE:.spec.name,SOURCE:.spec.source,CHANNEL:.spec.channel,CURRENT_CSV:.status.currentCSV,STATE:.status.state" 2>/dev/null || echo "Subscription status unavailable"
-    echo
-    
-    # Check if operator pods are running
-    local operator_pods_ready=$(oc get pods -n "$OPERATOR_NAMESPACE" -o jsonpath='{.items[*].status.containerStatuses[*].ready}' 2>/dev/null | grep -o "true" | wc -l || echo "0")
-    local total_operator_pods=$(oc get pods -n "$OPERATOR_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
-    
-    if [ "${total_operator_pods}" -gt 0 ] && [ "${operator_pods_ready}" -eq "${total_operator_pods}" ]; then
-        log_success "${OPERATOR^} operator installation completed successfully!"
-        log_success "All ${total_operator_pods} operator pods are running and ready"
-    else
-        log_warning "${OPERATOR^} operator installation may have issues:"
-        log_info "   - Total pods: ${total_operator_pods}"
-        log_info "   - Ready pods: ${operator_pods_ready}"
-        log_info "   Please check pod status and logs for issues."
-    fi
-    
-    echo
-    log_info "Verification commands:"
-    echo "   Check operator status: oc get pods -n $OPERATOR_NAMESPACE"
-    echo "   Check CSV status: oc get csv -n $OPERATOR_NAMESPACE"  
-    echo "   Check subscription: oc get subscription -n $OPERATOR_NAMESPACE"
-    echo "   Check operator logs: oc logs -n $OPERATOR_NAMESPACE -l app.kubernetes.io/name=${OPERATOR}-operator --tail=50"
 }
 
 # Cleanup function
 cleanup() {
-    log_info "Cleaning up temporary files..."
     rm -f /tmp/fbc_image_url /tmp/opm_render_output.json
     rm -f /tmp/${OPERATOR:-*}_related_images.txt /tmp/${OPERATOR:-*}_repositories.txt /tmp/${OPERATOR:-*}_default_channel.txt /tmp/${OPERATOR:-*}_install_mode.txt /tmp/${OPERATOR:-*}_image_mappings.txt
     rm -f /tmp/${OPERATOR:-*}_catalog_source.yaml /tmp/${OPERATOR:-*}_namespace.yaml /tmp/${OPERATOR:-*}_operator_group.yaml /tmp/${OPERATOR:-*}_subscription.yaml /tmp/${OPERATOR:-*}_idms.yaml
@@ -1033,30 +827,13 @@ main() {
     # Set operator-specific configuration
     set_operator_config
     
-    # Export kubeconfig
-    export KUBECONFIG
+    
+    log_info "Starting ${OPERATOR} operator installation for OpenShift ${VERSION}"
     
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_warning "=== DRY-RUN MODE ENABLED ==="
-        log_warning "No resources will be created on the cluster. Only showing what would be done."
-        # Temporarily disable pipefail in dry-run mode to prevent early exit
+        log_info "DRY-RUN MODE - No resources will be created"
         set +e
-        echo
     fi
-    
-    log_info "Starting ${OPERATOR^} Operator installation for disconnected OpenShift cluster"
-    log_info "Version: $VERSION"
-    log_info "Operator: $OPERATOR"
-    log_info "Local Registry: $LOCAL_REGISTRY"
-    log_info "Kubeconfig: $KUBECONFIG"
-    log_info "Auth file: $AUTHFILE"
-    log_info "FBC Source Image: $FBC_SOURCE_IMAGE"
-    log_info "Operator Namespace: $OPERATOR_NAMESPACE"
-    log_info "Catalog Name: $CATALOG_NAME"
-    if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "Mode: DRY-RUN (no actual changes will be made)"
-    fi
-    echo
     
     # Set trap for cleanup
     trap cleanup EXIT
@@ -1065,7 +842,7 @@ main() {
     check_prerequisites
     cleanup_existing_resources
     mirror_fbc_image
-    extract_related_images
+    extract_operator_metadata
     mirror_related_images
     create_image_digest_mirror_set
     wait_for_mcp_update
@@ -1077,25 +854,46 @@ main() {
     wait_for_csv
     
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        echo
-        log_success "🎉 [DRY-RUN] ${OPERATOR^} Operator installation plan completed!"
-        log_info "=== DRY-RUN SUMMARY ==="
-        log_info "The following YAML files would be created and applied to the cluster:"
-        echo "  1. ImageDigestMirrorSet: /tmp/${OPERATOR}_idms.yaml"
-        echo "  2. CatalogSource:        /tmp/${OPERATOR}_catalog_source.yaml"
-        echo "  3. Namespace:            /tmp/${OPERATOR}_namespace.yaml"
-        echo "  4. OperatorGroup:        /tmp/${OPERATOR}_operator_group.yaml"
-        echo "  5. Subscription:         /tmp/${OPERATOR}_subscription.yaml"
-        echo
-        log_info "Additional steps that would be executed:"
-        echo "  - Wait for MachineConfigPool updates after IDMS (up to 35 minutes + 10 min stabilization)"
-        echo "  - Monitor CatalogSource readiness"
-        echo "  - Wait for CSV installation completion"
-        log_info "All YAML contents were displayed above during the dry-run."
-        log_info "To execute the actual installation, run the same command without --dry-run"
+        log_success "Dry-run completed successfully"
+        log_info "To execute: remove --dry-run flag and re-run"
     else
-        log_success "🎉 ${OPERATOR^} Operator installation completed successfully!"
-        log_info "You can now use the ${OPERATOR} operator in your disconnected cluster."
+        # Final verification and status reporting
+        log_info "Final verification and status reporting..."
+        echo
+        log_info "Current CSV status:"
+        oc get csv -n "$OPERATOR_NAMESPACE" 2>/dev/null || echo "No CSVs found in $OPERATOR_NAMESPACE"
+        echo
+        
+        log_info "Current operator pods:"
+        oc get pods -n "$OPERATOR_NAMESPACE" 2>/dev/null || echo "No pods found in $OPERATOR_NAMESPACE"
+        echo
+        
+        log_info "Subscription status:"
+        oc get subscription -n "$OPERATOR_NAMESPACE" -o custom-columns="NAME:.metadata.name,PACKAGE:.spec.name,SOURCE:.spec.source,CHANNEL:.spec.channel,CURRENT_CSV:.status.currentCSV,STATE:.status.state" 2>/dev/null || echo "Subscription status unavailable"
+        echo
+        
+        # Check if operator pods are running
+        local operator_pods_ready=$(oc get pods -n "$OPERATOR_NAMESPACE" -o jsonpath='{.items[*].status.containerStatuses[*].ready}' 2>/dev/null | grep -o "true" | wc -l || echo "0")
+        local total_operator_pods=$(oc get pods -n "$OPERATOR_NAMESPACE" --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        if [ "${total_operator_pods}" -gt 0 ] && [ "${operator_pods_ready}" -eq "${total_operator_pods}" ]; then
+            log_success "${OPERATOR} operator installation completed successfully!"
+            log_success "All ${total_operator_pods} operator pods are running and ready"
+        else
+            log_warning "${OPERATOR} operator installation may have issues:"
+            log_info "   - Total pods: ${total_operator_pods}"
+            log_info "   - Ready pods: ${operator_pods_ready}"
+            log_info "   Please check pod status and logs for issues."
+        fi
+        
+        echo
+        log_info "Verification commands:"
+        echo "   Check operator status: oc get pods -n $OPERATOR_NAMESPACE"
+        echo "   Check CSV status: oc get csv -n $OPERATOR_NAMESPACE"  
+        echo "   Check subscription: oc get subscription -n $OPERATOR_NAMESPACE"
+        echo "   Check operator logs: oc logs -n $OPERATOR_NAMESPACE -l app.kubernetes.io/name=${OPERATOR}-operator --tail=50"
+        echo
+        log_success "${OPERATOR} operator installation script finished."
     fi
 }
 

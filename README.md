@@ -1,24 +1,15 @@
 # 🚀 Konflux Telco Operator Deployment Script
 
-> **Deploy telco operators in disconnected OpenShift clusters with confidence!**
+> **Deploy telco operators in disconnected OpenShift clusters!**
 
-This powerful automation script streamlines the deployment of critical telco operators (SR-IOV, MetalLB, nmstate, and PTP) in air-gapped OpenShift environments. Built for production reliability with comprehensive error handling, intelligent cleanup, and advanced monitoring capabilities.
-
-## ✨ Features
-
-- **cleanup** - Reemoves existing installations for clean deployments
-- **Image mirroring** - Mirrors FBC and all related operator images to your internal registry
-- **IDMS creation** - Automatically generates ImageDigestMirrorSet for disconnected environments
-- **Dry-run mode** - Preview all operations without making changes
+This automation script streamlines the deployment of critical telco operators (SR-IOV, MetalLB, nmstate, and PTP) in disconnected OpenShift environments. 
 
 ## 🎛️ Supported Operators
 
-| Operator | Namespace | Install Mode | Description |
-|----------|-----------|--------------|-------------|
-| **sriov** | `openshift-sriov-network-operator` | OwnNamespace | SR-IOV Network Operator for hardware acceleration |
-| **metallb** | `metallb-system` | AllNamespaces | Load balancer implementation for bare metal |
-| **nmstate** | `openshift-nmstate` | OwnNamespace | Declarative network configuration |
-| **ptp** | `openshift-ptp` | OwnNamespace | Precision Time Protocol for time synchronization |
+- **sriov**
+- **metallb** 
+- **nmstate**
+- **ptp**
 
 ## 📋 Prerequisites
 
@@ -28,8 +19,20 @@ This powerful automation script streamlines the deployment of critical telco ope
 - `jq` for JSON processing
 - Access to internal container registry
 - Authentication files for both internal registry and quay.io
+- Administrative privileges on OpenShift cluster
 
 ## 🚀 Quick Start
+
+## 📖 Command Line Arguments
+
+| Argument | Description | Required | Example |
+|----------|-------------|----------|---------|
+| `--operator` | Telco operator to deploy (`sriov`\|`metallb`\|`nmstate`\|`ptp`) | ✅ | `--operator sriov` |
+| `--version` | OpenShift version (determines image tags) | ✅ | `--version 4.20` |
+| `--internal-registry` | URL of your internal container registry | ✅ | `--internal-registry registry.example.com:5000` |
+| `--internal-registry-auth` | Authentication file for internal registry | ✅ | `--internal-registry-auth /path/to/auth.json` |
+| `--quay-auth` | Authentication file for quay.io access | ✅ | `--quay-auth /path/to/quay-auth.json` |
+| `--dry-run` | Preview mode - show operations without executing | ❌ | `--dry-run` |
 
 ### Basic Deployment
 ```bash
@@ -101,36 +104,25 @@ KUBECONFIG=/home/kni/clusterconfigs/auth/kubeconfig \
   --quay-auth /home/kni/combined-secret.json
 ```
 
-## 📖 Command Line Arguments
 
-| Argument | Description | Required | Example |
-|----------|-------------|----------|---------|
-| `--operator` | Telco operator to deploy (`sriov`\|`metallb`\|`nmstate`\|`ptp`) | ✅ | `--operator sriov` |
-| `--version` | OpenShift version (determines image tags) | ✅ | `--version 4.20` |
-| `--internal-registry` | URL of your internal container registry | ✅ | `--internal-registry registry.example.com:5000` |
-| `--internal-registry-auth` | Authentication file for internal registry | ✅ | `--internal-registry-auth /path/to/auth.json` |
-| `--quay-auth` | Authentication file for quay.io access | ✅ | `--quay-auth /path/to/quay-auth.json` |
-| `--dry-run` | Preview mode - show operations without executing | ❌ | `--dry-run` |
 
 ## 🔄 Deployment Process
 
-The script follows a comprehensive 13-step process:
+The script follows a streamlined 11-step process:
 
 ```
 Step 0: 🧹 Clean up existing resources
-Step 1: 📦 Mirror FBC image to local registry  
-Step 2: 🔍 Extract related images using opm render
-Step 3: 🚚 Mirror all related images to local registry
+Step 1: 📦 Mirror FBC image to internal registry  
+Step 2: 🔍 Extract operator metadata (images, channel, install mode)
+Step 3: 🚚 Mirror all related images to internal registry
 Step 4: 🎯 Create ImageDigestMirrorSet (IDMS)
-Step 5: ⏳ Wait for MachineConfigPool updates  
+Step 5: ⏳ Wait for MachineConfigPool updates (with oc wait)
 Step 6: 📋 Create CatalogSource
 Step 7: ✅ Verify CatalogSource readiness
 Step 8: 🏗️ Create operator namespace
-Step 9: 👥 Create OperatorGroup (dynamic config)
+Step 9: 👥 Create OperatorGroup
 Step 10: 📝 Create Subscription
-Step 11: 🔍 Monitor subscription health
-Step 12: ⏱️ Wait for CSV installation
-Step 13: 🎉 Final verification and status report
+Step 11: ⏱️ Wait for CSV installation and final verification
 ```
 
 ## 🎪 Dry-Run Mode Features
@@ -143,123 +135,21 @@ Dry-run mode provides complete visibility without making changes:
 ```
 
 **What dry-run shows:**
-- 📋 All YAML files that would be created
-- 🔧 All `oc` commands that would be executed  
+- 📋 All YAML files with **highlighted borders** for easy identification
+- 🔧 All `oc` commands with **clear borders** and descriptions
 - 🚚 All image mirroring operations
+- 📊 **Operator metadata**: channel, install mode, image counts
 - ⚙️ Complete deployment plan with real data
+
+- 🎨 **Bordered YAML content** - Easy to copy and distinguish from logs
+- 🎯 **Bordered command display** - Clear command separation
+- 📈 **Progress indicators** - Shows exactly what would be executed
+- 🔍 **Metadata visibility** - Channel and install mode detection results
 
 **What dry-run does NOT do:**
 - ❌ Apply any resources to the cluster
 - ❌ Mirror any images
 - ❌ Modify cluster state
 
-*Note: `opm render` still executes to populate YAMLs with real data*
+*Note: `opm render` still executes to populate YAMLs with real operator metadata*
 
-## 🛠️ Advanced Features
-
-### Intelligent Install Mode Detection
-The script automatically detects the correct install mode:
-- **AllNamespaces**: Creates OperatorGroup with empty spec `{}`
-- **OwnNamespace**: Creates OperatorGroup with `targetNamespaces: [operator-namespace]`
-- **SingleNamespace**: Same as OwnNamespace
-
-### MCP Timeout Handling
-Smart MachineConfigPool monitoring:
-- Waits up to 1 minute for MCP updates to start
-- If updates start, waits up to 10 minutes for completion  
-- If no updates needed, gracefully continues
-- Includes 10-minute stabilization period
-
-### Comprehensive Error Handling
-- **Image mirror failures**: Script exits immediately with clear error messages
-- **Subscription issues**: Automatic problematic catalog source removal
-- **CSV failures**: Detailed diagnostics and troubleshooting information
-- **Network timeouts**: Graceful handling with retry logic
-
-## 📊 Sample Output
-
-### Successful Deployment
-```
-🎉 Sriov Operator installation completed successfully!
-
-Current CSV status:
-NAME                                    DISPLAY               VERSION               PHASE
-sriov-network-operator.v4.20.0-xxx     SR-IOV Network Operator   4.20.0-xxx       Succeeded
-
-Current operator pods:
-NAME                                          READY   STATUS    RESTARTS   AGE
-sriov-network-config-daemon-abc12            3/3     Running   0          2m
-sriov-network-operator-123def-xyz99          1/1     Running   0          3m
-```
-
-### Dry-Run Preview
-```
-=== DRY-RUN MODE ENABLED ===
-No resources will be created on the cluster. Only showing what would be done.
-
-[DRY-RUN YAML] ImageDigestMirrorSet that would be applied
-------- File: /tmp/sriov_idms.yaml -------
-apiVersion: config.openshift.io/v1
-kind: ImageDigestMirrorSet
-metadata:
-  name: sriov-quay-idms
-spec:
-  imageDigestMirrors:
-  - mirrors:
-    - registry.example.com:5000/redhat-user-workloads/ocp-art-tenant/art-images-share
-    source: registry.redhat.io/openshift4/ose-sriov-network-rhel9-operator
-[...]
-
-[DRY-RUN COMMAND] oc apply -f "/tmp/sriov_idms.yaml"
-[DRY-RUN COMMAND] oc image mirror -a="/path/to/auth.json" [...]
-```
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**Q: Script fails with "image mirror failed"**  
-A: Check your authentication files and network connectivity to quay.io and your internal registry.
-
-**Q: MachineConfigPool updates never complete**  
-A: This is normal for some IDMS configurations. The script will timeout gracefully and continue.
-
-**Q: Subscription stuck in "Installing" state**  
-A: The script includes advanced monitoring that will automatically detect and resolve common issues.
-
-**Q: "OwnNamespace InstallModeType not supported" error**  
-A: This has been fixed! The script now correctly detects install modes from the operator bundle.
-
-### Verification Commands
-```bash
-# Check operator status
-oc get csv -n <operator-namespace>
-oc get pods -n <operator-namespace>
-oc get subscription -n <operator-namespace>
-
-# Check IDMS status  
-oc get imagedigestmirrorset
-oc get mcp
-
-# Check logs
-oc logs -n <operator-namespace> -l app.kubernetes.io/name=<operator-name>
-```
-
-## 🤝 Contributing
-
-This script has been battle-tested across multiple OpenShift environments and telco operators. It includes comprehensive error handling, intelligent automation, and production-ready reliability features.
-
-### Key Design Principles
-- **Fail-fast**: Exit immediately on critical errors
-- **Idempotent**: Safe to run multiple times  
-- **Transparent**: Clear logging and dry-run capabilities
-- **Robust**: Handles edge cases and network issues gracefully
-
-## 📄 License
-
-This script is provided as-is for telco operator deployments in disconnected OpenShift environments.
-
----
-
-**Ready to deploy your telco operators?** 🚀  
-Start with a dry-run to see exactly what the script will do, then execute for a seamless deployment experience!
