@@ -6,23 +6,10 @@ This powerful automation script streamlines the deployment of critical telco ope
 
 ## ✨ Features
 
-🎯 **Smart & Reliable**
-- **Intelligent cleanup** - Automatically removes existing installations for clean deployments
-- **Fail-fast mirroring** - Exits immediately on image mirror failures
-- **Dynamic install mode detection** - Automatically configures `AllNamespaces` vs `OwnNamespace` modes
-- **Comprehensive error handling** - Robust monitoring with detailed diagnostics
-
-🔧 **Production-Ready**  
+- **cleanup** - Reemoves existing installations for clean deployments
 - **Image mirroring** - Mirrors FBC and all related operator images to your internal registry
 - **IDMS creation** - Automatically generates ImageDigestMirrorSet for disconnected environments
-- **MCP monitoring** - Intelligently waits for MachineConfigPool updates with timeout handling
-- **CSV monitoring** - Advanced subscription health monitoring with automatic issue resolution
-
-🎪 **Developer Friendly**
 - **Dry-run mode** - Preview all operations without making changes
-- **Cross-operator support** - Works seamlessly across all four telco operators  
-- **Detailed logging** - Color-coded output with clear success/warning/error messages
-- **Flexible configuration** - Dynamic operator-specific settings
 
 ## 🎛️ Supported Operators
 
