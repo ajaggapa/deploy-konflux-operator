@@ -258,7 +258,7 @@ extract_operator_metadata() {
         exit 1
     fi
     
-    # Extract relatedImages, repositories, and metadata
+    # Extract relatedImages, repositories, and metadata from the latest bundle
     log_info "Parsing operator metadata from catalog content..."
     
     local related_images_file="/tmp/${OPERATOR}_related_images.txt"
@@ -270,30 +270,47 @@ extract_operator_metadata() {
     > "$channel_file"
     > "$install_mode_file"
     
-    # Extract full related images and unique repositories
+    # Extract metadata from catalog content
     if command -v jq &> /dev/null; then
-        # Extract full related images (repo@digest format)
-        jq -r '.relatedImages[]?.image // empty' "$temp_render_output" | \
+        # First, find the latest bundle based on bundle name (assuming date format in name)
+        log_info "Identifying the latest bundle from multiple olm.bundle entries..."
+        
+        # Extract all bundle names and find the latest one
+        local latest_bundle_name=$(jq -r 'select(.schema == "olm.bundle") | .name' "$temp_render_output" | \
+            sort -V | tail -1)
+        
+        if [[ -z "$latest_bundle_name" ]]; then
+            log_error "No olm.bundle entries found in catalog"
+            exit 1
+        fi
+        
+        log_info "Selected latest bundle: $latest_bundle_name"
+        
+        # Create a temporary file with only the latest bundle data
+        local latest_bundle_file="/tmp/${OPERATOR}_latest_bundle.json"
+        jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle_name\")" "$temp_render_output" > "$latest_bundle_file"
+        
+        # Extract related images from the latest bundle only
+        jq -r '.relatedImages[]?.image // empty' "$latest_bundle_file" | \
         grep -v '^$' | sort -u > "$related_images_file"
         
-        # Extract unique repositories (without digests) for IDMS
-        jq -r '.relatedImages[]?.image // empty' "$temp_render_output" | \
+        # Extract unique repositories (without digests) for IDMS from latest bundle
+        jq -r '.relatedImages[]?.image // empty' "$latest_bundle_file" | \
         grep -v '^$' | \
         sed 's/@sha256:[a-f0-9]\{64\}$//' | \
         sort -u > "$repositories_file"
         
-        # Extract defaultChannel from the package
+        # Extract defaultChannel from the package (this is still global, not bundle-specific)
         jq -r 'select(.schema == "olm.package") | .defaultChannel // empty' "$temp_render_output" | \
         head -1 > "$channel_file"
         
-        # Extract installMode - find the first supported install mode from bundle metadata
+        # Extract installMode from the latest bundle only
         local supported_install_mode=$(jq -r '
-            select(.schema == "olm.bundle") | 
             .properties[]? | 
             select(.type == "olm.csv.metadata") | 
             .value.installModes[]? | 
             select(.supported == true) | 
-            .type' "$temp_render_output" | head -1)
+            .type' "$latest_bundle_file" | head -1)
         
         if [[ -n "$supported_install_mode" ]]; then
             echo "$supported_install_mode" > "$install_mode_file"
@@ -301,8 +318,14 @@ extract_operator_metadata() {
             # Fallback to SingleNamespace if no modes found
             echo "SingleNamespace" > "$install_mode_file"
         fi
+        
+        # Clean up temporary file
+        rm -f "$latest_bundle_file"
     else
-        # Fallback if jq is not available
+        # Fallback if jq is not available - limited functionality
+        log_warning "jq is not available. Latest bundle selection not supported in fallback mode."
+        log_warning "Using all bundles data (may include outdated information)"
+        
         grep -o '[^"]*@sha256:[a-f0-9]\{64\}' "$temp_render_output" | \
         sort -u > "$related_images_file"
         
@@ -815,7 +838,7 @@ wait_for_csv() {
 # Cleanup function
 cleanup() {
     rm -f /tmp/fbc_image_url /tmp/opm_render_output.json
-    rm -f /tmp/${OPERATOR:-*}_related_images.txt /tmp/${OPERATOR:-*}_repositories.txt /tmp/${OPERATOR:-*}_default_channel.txt /tmp/${OPERATOR:-*}_install_mode.txt /tmp/${OPERATOR:-*}_image_mappings.txt
+    rm -f /tmp/${OPERATOR:-*}_related_images.txt /tmp/${OPERATOR:-*}_repositories.txt /tmp/${OPERATOR:-*}_default_channel.txt /tmp/${OPERATOR:-*}_install_mode.txt /tmp/${OPERATOR:-*}_image_mappings.txt /tmp/${OPERATOR:-*}_latest_bundle.json
     rm -f /tmp/${OPERATOR:-*}_catalog_source.yaml /tmp/${OPERATOR:-*}_namespace.yaml /tmp/${OPERATOR:-*}_operator_group.yaml /tmp/${OPERATOR:-*}_subscription.yaml /tmp/${OPERATOR:-*}_idms.yaml
 }
 
