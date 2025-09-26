@@ -24,6 +24,9 @@ This automation script streamlines the deployment of critical telco operators (S
 ## 🚀 Quick Start
 
 ## 📖 Command Line Arguments
+# !! Currently auth file for both internal registry and quay should be the same. Separate files option will be made feasible later !!
+
+
 
 | Argument | Description | Required | Example |
 |----------|-------------|----------|---------|
