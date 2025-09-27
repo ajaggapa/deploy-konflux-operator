@@ -481,7 +481,7 @@ EOF
 wait_for_mcp_update() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         log_info "Step 5: [DRY-RUN] Would wait for MachineConfigPool updates..."
-        show_command "oc wait --for=condition=Updating mcp --all --timeout=300s"
+        show_command "oc wait --for=condition=Updating mcp --all --timeout=120s"
         show_command "oc wait --for=condition=Updating=false mcp --all --timeout=600s"
         return 0
     fi
@@ -501,20 +501,42 @@ add_registry_to_insecure_registries() {
     
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
         show_command "oc patch image.config.openshift.io/cluster --patch '{\"spec\":{ \"registrySources\": { \"insecureRegistries\" : [\"${INTERNAL_REGISTRY}\"] }}}' --type=merge"
+        log_info "[DRY-RUN] Would then call wait_for_mcp_update to wait for MachineConfigPool updates..."
         return 0
     fi
     
     if oc patch image.config.openshift.io/cluster --patch '{"spec":{ "registrySources": { "insecureRegistries" : ["'"${INTERNAL_REGISTRY}"'"] }}}' --type=merge; then
         log_success "Internal registry added to insecure registries successfully"
+        
+        # Wait for MCP updates after image configuration change
+        log_info "Waiting for MachineConfigPool updates after image configuration change..."
+        wait_for_mcp_update
     else
         log_error "Failed to patch cluster image configuration"
         exit 1
     fi
 }
 
-# Step 7: Apply CatalogSource YAML
+# Step 7: Disable all default catalog sources
+disable_default_catalog_sources() {
+    log_info "Step 7: Disabling all default catalog sources..."
+    
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        show_command "oc patch operatorhub cluster -p '{\"spec\": {\"disableAllDefaultSources\": true}}' --type=merge"
+        return 0
+    fi
+    
+    if oc patch operatorhub cluster -p '{"spec": {"disableAllDefaultSources": true}}' --type=merge; then
+        log_success "All default catalog sources disabled successfully"
+    else
+        log_error "Failed to patch operatorhub cluster"
+        exit 1
+    fi
+}
+
+# Step 8: Apply CatalogSource YAML
 apply_catalog_source() {
-    log_info "Step 7: Creating CatalogSource..."
+    log_info "Step 8: Creating CatalogSource..."
     
     # Get FBC image URL - handle both dry-run and real execution
     local fbc_image_url
@@ -566,17 +588,17 @@ EOF
     fi
 }
 
-# Step 8: Check CatalogSource status
+# Step 9: Check CatalogSource status
 check_catalog_source_ready() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "Step 8: [DRY-RUN] Would wait for CatalogSource to be ready..."
+        log_info "Step 9: [DRY-RUN] Would wait for CatalogSource to be ready..."
         show_command "oc get catalogsource \"$CATALOG_NAME\" -n openshift-marketplace -o jsonpath='{.status.connectionState.lastObservedState}'"
         show_command "oc get catalogsource \"$CATALOG_NAME\" -n openshift-marketplace -o yaml"
         log_info "[DRY-RUN] Would wait for CatalogSource to become READY"
         return 0
     fi
     
-    log_info "Step 8: Waiting for CatalogSource to be ready..."
+    log_info "Step 9: Waiting for CatalogSource to be ready..."
     
     local max_attempts=30
     local attempt=1
@@ -599,9 +621,9 @@ check_catalog_source_ready() {
     exit 1
 }
 
-# Step 9: Create operator namespace
+# Step 10: Create operator namespace
 create_operator_namespace() {
-    log_info "Step 9: Creating operator namespace..."
+    log_info "Step 10: Creating operator namespace..."
     
     local namespace_yaml="/tmp/${OPERATOR}_namespace.yaml"
     
@@ -644,9 +666,9 @@ EOF
     fi
 }
 
-# Step 10: Create OperatorGroup
+# Step 11: Create OperatorGroup
 create_operator_group() {
-    log_info "Step 10: Creating OperatorGroup..."
+    log_info "Step 11: Creating OperatorGroup..."
     
     local operator_group_yaml="/tmp/${OPERATOR}_operator_group.yaml"
     local install_mode_file="/tmp/${OPERATOR}_install_mode.txt"
@@ -693,9 +715,9 @@ EOF
     fi
 }
 
-# Step 11: Create Subscription
+# Step 12: Create Subscription
 create_subscription() {
-    log_info "Step 11: Creating Subscription..."
+    log_info "Step 12: Creating Subscription..."
     
     local subscription_yaml="/tmp/${OPERATOR}_subscription.yaml"
     local channel_file="/tmp/${OPERATOR}_default_channel.txt"
@@ -741,7 +763,7 @@ EOF
     fi
 }
 
-# Step 12: Wait for CSV creation
+# Step 13: Wait for CSV creation
 # Function to monitor subscription health and handle common issues
 monitor_subscription_health() {
     local subscription_name="$1"
@@ -831,12 +853,12 @@ monitor_subscription_health() {
 
 wait_for_csv() {
     if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        log_info "Step 12: [DRY-RUN] Would wait for CSV installation..."
+        log_info "Step 13: [DRY-RUN] Would wait for CSV installation..."
         show_command "oc wait --for=jsonpath='{.status.phase}'=Succeeded csv --all -n \"$OPERATOR_NAMESPACE\" --timeout=180s"
         return 0
     fi
     
-    log_info "Step 12: Waiting for CSV installation..."
+    log_info "Step 13: Waiting for CSV installation..."
     
     # Monitor subscription health and wait for CSV
     if ! monitor_subscription_health "${OPERATOR_NAME}" "$OPERATOR_NAMESPACE" 180; then
@@ -887,6 +909,7 @@ main() {
     create_image_digest_mirror_set
     wait_for_mcp_update
     add_registry_to_insecure_registries
+    disable_default_catalog_sources
     apply_catalog_source
     check_catalog_source_ready
     create_operator_namespace
