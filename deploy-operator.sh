@@ -307,9 +307,16 @@ EOF
 
 # Wait for CSV
 
-oc wait --for=jsonpath='{.status.phase}'=Succeeded csv --all -n "$OPERATOR_NAMESPACE" --timeout=600s 2>/dev/null || true
+echo "Waiting for CSV ${latest_bundle} to be created..."
+oc wait --for=create csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=90s 2>/dev/null || \
+    { echo "WARNING: CSV ${latest_bundle} was not created within timeout" >&2; }
+
+echo "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
+oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=120s 2>/dev/null || \
+    { echo "WARNING: CSV ${latest_bundle} did not reach Succeeded phase within timeout" >&2; }
 
 # Wait for operator pods
-
-oc wait --for=condition=Ready pods --all -n "$OPERATOR_NAMESPACE" --timeout=300s 2>/dev/null || true
+echo "Waiting for operator pods to be ready..."
+oc wait --for=condition=Ready pods --all -n "$OPERATOR_NAMESPACE" --timeout=120s 2>/dev/null || \
+    { echo "WARNING: Operator pods did not reach Ready state within timeout" >&2; }
 
