@@ -1,0 +1,8 @@
+# Ignore git files
+.git
+.gitignore
+
+# Ignore build artifacts
+*.log
+*.tmp
+
