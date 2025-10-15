@@ -97,12 +97,42 @@ ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share
 # Authenticate registries
 
 if [[ "$DISCONNECTED" == true ]]; then
-    quay_auth_b64=$(jq -r '.auths | to_entries[] | select(.key | test("^(https://)?quay.io")) | .value.auth' "$QUAY_AUTH" 2>/dev/null | head -1)
+    quay_auth_b64=""
+    quay_auth_source=""
+    
+    # Priority 1: Try specific repository auth (quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share)
+    quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
+    if [[ -n "$quay_auth_key" ]]; then
+        quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
+        quay_auth_source="$quay_auth_key"
+    fi
+    
+    # Priority 2: Try broader repository auth (quay.io/redhat-user-workloads)
+    if [[ -z "$quay_auth_b64" ]]; then
+        quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
+        if [[ -n "$quay_auth_key" ]]; then
+            quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
+            quay_auth_source="$quay_auth_key"
+        fi
+    fi
+    
+    # Priority 3: Fall back to general quay.io domain auth
+    if [[ -z "$quay_auth_b64" ]]; then
+        quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | test("^(https://)?quay\\.io/?$")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
+        if [[ -n "$quay_auth_key" ]]; then
+            quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
+            quay_auth_source="$quay_auth_key"
+        fi
+    fi
+    
     if [[ -n "$quay_auth_b64" ]]; then
         quay_user=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f1)
         quay_pass=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f2-)
+        echo "Authenticating to quay.io using credentials from: $quay_auth_source"
+        echo "  Username: $quay_user"
         echo "$quay_pass" | podman login --username "$quay_user" --password-stdin quay.io >/dev/null 2>&1
     else
+        echo "Authenticating to quay.io using authfile: $QUAY_AUTH"
         podman login --authfile="$QUAY_AUTH" quay.io >/dev/null 2>&1
     fi || { echo "ERROR: Failed to auth quay.io" >&2; exit 1; }
     
@@ -116,7 +146,8 @@ if [[ "$DISCONNECTED" == true ]]; then
     fi || { echo "ERROR: Failed to auth internal registry" >&2; exit 1; }
 else
     current_pull_secret=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
-    merged_auth=$(echo "$current_pull_secret" "$QUAY_AUTH" | jq -s '.[0].auths * .[1].auths | {auths: .}')
+    quay_auth_content=$(cat "$QUAY_AUTH")
+    merged_auth=$(echo "$current_pull_secret" "$quay_auth_content" | jq -s '.[0].auths * .[1].auths | {auths: .}')
     echo "$merged_auth" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
         { echo "ERROR: Failed to update cluster pull-secret" >&2; exit 1; }
     echo "Updated cluster pull-secret with quay.io credentials"
