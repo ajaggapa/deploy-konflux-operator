@@ -515,8 +515,8 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
     echo "============================================================"
     
     # Arrays to track deployment status
-    declare -a FAILED_OPERATORS
-    declare -a SUCCESS_OPERATORS
+    declare -a FAILED_OPERATORS=()
+    declare -a SUCCESS_OPERATORS=()
     
     for op in "${OPERATORS[@]}"; do
         echo ""
