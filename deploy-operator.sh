@@ -4,6 +4,9 @@ set -Eeuo pipefail
 
 # Parse arguments
 
+# Set default timeout
+MCP_TIMEOUT="${MCP_TIMEOUT:-600s}"
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --operator) OPERATOR="$2"; shift 2 ;;
@@ -11,6 +14,7 @@ while [[ $# -gt 0 ]]; do
         --internal-registry) INTERNAL_REGISTRY="$2"; shift 2 ;;
         --internal-registry-auth) INTERNAL_REGISTRY_AUTH="$2"; shift 2 ;;
         --quay-auth) QUAY_AUTH="$2"; shift 2 ;;
+        --mcp-timeout) MCP_TIMEOUT="$2"; shift 2 ;;
         *) echo "ERROR: Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -459,7 +463,7 @@ spec:
     echo ""
     echo "Waiting for MachineConfigPool to update (once for all operators)..."
     oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=600s >/dev/null 2>&1 || true
+    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
     
 else
     # Single operator IDMS
@@ -487,7 +491,7 @@ spec:
     } | oc apply -f - || { echo "ERROR: IDMS apply failed" >&2; exit 1; }
     
     oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=600s >/dev/null 2>&1 || true
+    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
 fi
 
 # Add insecure registry
@@ -497,7 +501,7 @@ if [[ "$DISCONNECTED" == true ]]; then
         { echo "ERROR: Failed to patch image config" >&2; exit 1; }
     
     oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=600s >/dev/null 2>&1 || true
+    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
 fi
 
 # Disable default catalogs

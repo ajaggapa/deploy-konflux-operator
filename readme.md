@@ -202,6 +202,7 @@ The script follows these steps when deploying an operator:
 | `--internal-registry <host:port>` | Internal registry location (enables disconnected mode) | No |
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
 | `--quay-auth <file>` | Quay.io authentication file | Yes |
+| `--mcp-timeout <duration>` | Timeout duration for MachineConfigPool updates (e.g., `600s`). Default: `600s` | No |
 
 **Notes:**
 - **Either** `--operator` **or** `--fbc-tag` is required (not both)
@@ -210,6 +211,7 @@ The script follows these steps when deploying an operator:
 - Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`
 - Disconnected mode requires both `--internal-registry` and `--internal-registry-auth`
 - Script automatically detects mode based on `--internal-registry` presence
+- For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
 
 ---
 
@@ -235,6 +237,14 @@ The script follows these steps when deploying an operator:
 ./deploy-operator.sh \
   --fbc-tag ocp__4.20__metallb-rhel9-operator \
   --quay-auth /path/to/quay-auth.json
+```
+
+**Custom MCP Timeout (for larger clusters):**
+```bash
+./deploy-operator.sh \
+  --operator sriov,metallb \
+  --quay-auth /path/to/quay-auth.json \
+  --mcp-timeout 1200s
 ```
 
 ---
@@ -265,6 +275,16 @@ The script follows these steps when deploying an operator:
   --internal-registry registry.example.com:5000 \
   --internal-registry-auth /path/to/internal-auth.json \
   --quay-auth /path/to/quay-auth.json
+```
+
+**Custom MCP Timeout (for larger clusters):**
+```bash
+./deploy-operator.sh \
+  --operator sriov,metallb,ptp \
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /path/to/internal-auth.json \
+  --quay-auth /path/to/quay-auth.json \
+  --mcp-timeout 20m
 ```
 
 ---
