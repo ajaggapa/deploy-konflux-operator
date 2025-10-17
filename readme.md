@@ -4,6 +4,176 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 
 ---
 
+## Connected Cluster Image Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          INTERNET (Quay.io)                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────────────────────┐   ┌─────────────────────────────┐ │
+│  │  Quay FBC Repository             │   │  Quay ART Images Repository │ │
+│  │  quay.io/.../art-fbc             │   │  quay.io/.../art-images-    │ │
+│  │                                  │   │         share               │ │
+│  │  🌐 PUBLIC (no auth needed)      │   │  🔒 PRIVATE (auth required)  │ │
+│  │                                  │   │     Uses: --quay-auth       │ │
+│  │  • FBC Images (contains          │   │                             │ │
+│  │    relatedImages metadata):      │   │  • Operator Images:         │ │
+│  │    ocp__4.20__sriov-operator     │   │    @sha256:abc123...        │ │
+│  │    ocp__4.20__metallb-operator   │   │    @sha256:def456...        │ │
+│  │    ocp__4.20__nmstate-operator   │   │    @sha256:ghi789...        │ │
+│  │    ... etc                       │   │    ... (hundreds of images) │ │
+│  └──────────────────────────────────┘   └─────────────────────────────┘ │
+│           │                                        │                    │
+│           │ ① Script reads                         │ ③ Cluster pulls   │
+│           │    FBC directly                        │    images directly │
+│           │    (no mirroring)                      │    when needed     │
+│           │                                        │                    │
+└───────────┼────────────────────────────────────────┼────────────────────┘
+            │                                        │
+            │                                        │
+            ▼                                        │
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CONNECTED CLUSTER ENVIRONMENT                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    OpenShift Cluster                              │  │
+│  │                                                                   │  │
+│  │  ② Script updates cluster pull-secret with --quay-auth           │  │
+│  │     credentials                                                   │  │
+│  │                                                                   │  │
+│  │  ┌────────────────────────────────────────────────────────────┐   │  │
+│  │  │ ImageDigestMirrorSets (IDMS) - Per Operator                │   │  │
+│  │  │                                                            │   │  │
+│  │  │  sriov-art-idms:                                           │   │  │
+│  │  │    source: registry.redhat.io/openshift4/ose-sriov-*       │   │  │
+│  │  │    mirrors: quay.io/.../art-images-share                   │   │  │
+│  │  │                                                            │   │  │
+│  │  │  metallb-art-idms:                                         │   │  │
+│  │  │    source: registry.redhat.io/openshift4/metallb-*         │   │  │
+│  │  │    mirrors: quay.io/.../art-images-share                   │   │  │
+│  │  │                                                            │   │  │
+│  │  │  [... nmstate, ptp, pfstatus IDMS ...]                     │   │  │
+│  │  └────────────────────────────────────────────────────────────┘   │  │
+│  │                                │                                  │  │
+│  │                                │ ④ When pod needs image          │  │
+│  │                                ▼                                  │  │
+│  │  ┌────────────────────────────────────────────────────────────┐   │  │
+│  │  │                  CRI-O / Image Pull Flow                   │   │  │
+│  │  │                                                            │   │  │
+│  │  │  Pod requests:                                             │   │  │
+│  │  │    registry.redhat.io/openshift4/ose-sriov@sha256:abc123   │   │  │
+│  │  │                                                            │   │  │
+│  │  │  IDMS redirects to:                                        │   │  │
+│  │  │    quay.io/.../art-images-share@sha256:abc123 ──────       ┼   ┼  ┤
+│  │  │                                                            │   │  │
+│  │  │  ✓ Image pulled from Quay.io using cluster pull-secret     │   │  │
+│  │  └────────────────────────────────────────────────────────────┘   │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  ① FBC Usage          - Script references FBC images directly from Quay.io (no mirroring)
+  ② Pull-Secret Update - Script merges --quay-auth into cluster pull-secret
+  ③ Direct Access      - Cluster pulls images directly from Quay.io (no mirroring needed)
+  ④ Runtime Redirect   - IDMS redirects image pulls to Quay.io ART repository
+```
+
+---
+
+## Disconnected Cluster Image Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          INTERNET (Quay.io)                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────────────────────┐   ┌─────────────────────────────┐ │
+│  │  Quay FBC Repository             │   │  Quay ART Images Repository │ │
+│  │  quay.io/.../art-fbc             │   │  quay.io/.../art-images-    │ │
+│  │                                  │   │         share               │ │
+│  │  🌐 PUBLIC (no auth needed)      │   │  🔒 PRIVATE (auth required)  │ │
+│  │                                  │   │     Uses: --quay-auth       │ │
+│  │  • FBC Images (contains          │   │                             │ │
+│  │    relatedImages metadata):      │   │  • Operator Images:         │ │
+│  │    ocp__4.20__sriov-operator     │   │    @sha256:abc123...        │ │
+│  │    ocp__4.20__metallb-operator   │   │    @sha256:def456...        │ │
+│  │    ocp__4.20__nmstate-operator   │   │    @sha256:ghi789...        │ │
+│  │    ... etc                       │   │    ... (hundreds of images) │ │
+│  └──────────────────────────────────┘   └─────────────────────────────┘ │
+│           │                                        │                    │
+└───────────┼────────────────────────────────────────┼────────────────────┘
+            │                                        │
+            │ ① Script pulls & mirrors               │ ② Script extracts
+            │    FBC images (5 images)               │    relatedImages from FBC
+            │                      │                 │    and mirrors ONLY those
+            │                      └─────────────────┤    (26 unique images)
+            ▼                                        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    AIR-GAPPED ENVIRONMENT                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              Internal Registry (registry.local:5000)              │  │
+│  │  /redhat-user-workloads/ocp-art-tenant/                           │  │
+│  │                                                                   │  │
+│  │  ├─ art-fbc/                      ├─ art-images-share/            │  │
+│  │  │   • ocp__4.20__sriov-operator  │   • @sha256:abc123...         │  │
+│  │  │   • ocp__4.20__metallb-op...   │   • @sha256:def456...         │  │
+│  │  │   • ocp__4.20__nmstate-op...   │   • @sha256:ghi789...         │  │
+│  │  │   • ocp__4.20__ptp-operator    │   • ... (all 26 images)       │  │
+│  │  │   • ocp__4.20__pfstatus-op...  │                               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                │                                        │
+│                                │ ③ Script references mirrored images   │
+│                                │    when creating IDMS                  │
+│                                ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    OpenShift Cluster                              │  │
+│  │                                                                   │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │ ImageDigestMirrorSets (IDMS) - Per Operator                │  │  │
+│  │  │                                                            │  │  │
+│  │  │  sriov-internal-idms:                                      │  │  │
+│  │  │    source: registry.redhat.io/openshift4/ose-sriov-*       │  │  │
+│  │  │    mirrors: registry.local:5000/.../art-images-share       │  │  │
+│  │  │                                                            │  │  │
+│  │  │  metallb-internal-idms:                                    │  │  │
+│  │  │    source: registry.redhat.io/openshift4/metallb-*         │  │  │
+│  │  │    mirrors: registry.local:5000/.../art-images-share       │  │  │
+│  │  │                                                            │  │  │
+│  │  │  [... nmstate, ptp, pfstatus IDMS ...]                     │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  │                                │                                 │  │
+│  │                                │ ④ When pod needs image         │  │
+│  │                                ▼                                 │  │
+│  │  ┌────────────────────────────────────────────────────────────┐  │  │
+│  │  │                  CRI-O / Image Pull Flow                   │  │  │
+│  │  │                                                            │  │  │
+│  │  │  Pod requests:                                             │  │  │
+│  │  │    registry.redhat.io/openshift4/ose-sriov@sha256:abc123   │  │  │
+│  │  │                                                            │  │  │
+│  │  │  IDMS redirects to:                                        │  │  │
+│  │  │    registry.local:5000/.../art-images-share@sha256:abc123  │  │  │
+│  │  │                                                            │  │  │
+│  │  │  ✓ Image pulled from internal registry                     │  │  │
+│  │  └────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+Legend:
+  ① FBC Mirroring      - Script mirrors catalog images (one per operator)
+  ② Related Images     - Script reads relatedImages from FBC, then mirrors ONLY those 
+                         specific images (deduplicated across all operators)
+  ③ IDMS Creation      - Script creates image redirect rules per operator
+  ④ Runtime Redirect   - IDMS transparently redirects image pulls to internal registry
+```
+
+---
+
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Script Modes](#script-modes)
@@ -12,17 +182,17 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 - [Connected Cluster Examples](#connected-cluster-examples)
 - [Disconnected Cluster Examples](#disconnected-cluster-examples)
 - [Authentication Files](#authentication-files)
-- [Predefined Operators](#predefined-operators)
 - [Features](#features)
-- [Common Scenarios](#common-scenarios)
+- [Error Handling](#error-handling)
 - [Error Examples](#error-examples)
 - [Quick Reference](#quick-reference)
+- [Cleanup Commands](#cleanup-commands)
+- [Version Information](#version-information)
 
 ---
 
 ## Prerequisites
 
-Required tools (script validates these automatically):
 - **oc** - OpenShift CLI
 - **opm** - Operator Package Manager
 - **jq** - JSON processor  
@@ -50,266 +220,114 @@ For clusters that can directly access `quay.io`:
   --quay-auth <quay-auth-file>
 ```
 
-```bash
-./deploy-operator.sh \
-  --fbc-tag <fbc-image-tag> \
-  --quay-auth <quay-auth-file>
-```
+---
 
 ### Disconnected Cluster Mode
-For air-gapped clusters with internal registry:
+For air-gapped clusters without direct quay.io access:
 
 **What happens:**
-- ✅ Authenticates to both quay.io and internal registry
 - ✅ Mirrors FBC image to internal registry
-- ✅ Mirrors all related images to internal registry
+- ✅ Mirrors all related operator images to internal registry
+- ✅ Configures internal registry as insecure
 - ✅ Creates IDMS mapping to internal registry
-- ✅ Configures insecure registry (if needed)
 - ✅ Waits for MCP updates to complete
+- ❌ NO cluster pull-secret modification
 
 **Usage:**
 ```bash
 ./deploy-operator.sh \
   --operator <name> \
   --internal-registry <host:port> \
-  --internal-registry-auth <internal-auth-file> \
+  --internal-registry-auth <auth-file> \
   --quay-auth <quay-auth-file>
 ```
-
-```bash
-./deploy-operator.sh \
-  --fbc-tag <fbc-image-tag> \
-  --internal-registry <host:port> \
-  --internal-registry-auth <internal-auth-file> \
-  --quay-auth <quay-auth-file>
-```
-
----
-
-## Features
-
-### Automatic Detection & Extraction
-
-#### 1. Cluster Version Detection
-```bash
-# Automatically runs:
-oc get clusterversion version -o jsonpath='{.status.desired.version}' | cut -d. -f1-2
-# Result: 4.17
-```
-
-#### 2. Smart Quay.io Authentication
-The script intelligently selects the best credentials from your auth file with priority:
-
-1. **Priority 1**: Specific repository credentials  
-   `quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share`
-2. **Priority 2**: Broader repository credentials  
-   `quay.io/redhat-user-workloads`
-3. **Priority 3**: General domain credentials  
-   `quay.io`
-
-The script displays which credentials are being used:
-```
-Authenticating to quay.io using credentials from: quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share
-  Username: redhat-user-workloads+ocp_art_tenant_art_images_share_98cc2cdb16_pull
-```
-
-#### 3. Operator Metadata Extraction
-From the FBC bundle, the script automatically extracts:
-- **Operator Name** - From bundle's `.package` field
-- **Bundle Name** - Latest versioned bundle
-- **Namespace** - From FBC annotation or derived as `openshift-<operator-name>`
-- **Channel** - Default channel from package manifest
-- **Install Mode** - SingleNamespace or AllNamespaces
-- **Related Images** - All operator container images
-
-#### 4. Mode Detection
-```bash
-# If --internal-registry provided → Disconnected mode
-# If NOT provided → Connected mode
-```
-
-### Example Script Output
-
-```
-Mode: Connected cluster
-Detected OCP version: 4.17
-Updated cluster pull-secret with quay.io credentials
-============================================================
-Extracted Metadata:
-============================================================
-Operator Name:    sriov-network-operator
-Bundle Name:      sriov-network-operator.v4.17.0-202501141644
-Namespace:        openshift-sriov-network-operator (from FBC annotation)
-Channel:          stable
-Install Mode:     SingleNamespace
-============================================================
-Related Images:
-============================================================
- 1. quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share@sha256:abc123...
- 2. quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share@sha256:def456...
- 3. quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share@sha256:ghi789...
-============================================================
-```
-
-### Error Handling
-
-The script validates and handles errors intelligently:
-
-**Pre-deployment Validation** (exits immediately):
-- ✅ All required commands installed (`oc`, `opm`, `jq`, `podman`)
-- ✅ Authentication files exist and contain valid JSON
-- ✅ Cluster connectivity
-- ✅ All operator names are valid
-- ✅ Registry authentication succeeds
-- ✅ Image mirroring operations complete
-- ✅ IDMS creation succeeds
-
-**Operator Deployment** (continues on failure when deploying multiple operators):
-- ✅ If one operator fails, script continues with remaining operators
-- ✅ Tracks successful and failed deployments separately
-- ✅ Provides deployment summary at the end
-- ✅ Exits with code 1 if any operators failed
-
-All errors show descriptive messages to stderr.
 
 ---
 
 ## Arguments
 
-### Required Arguments
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes |
+| `--internal-registry <host:port>` | Internal registry location (enables disconnected mode) | No |
+| `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
+| `--quay-auth <file>` | Quay.io authentication file | Yes |
 
-| Argument | Description | Example |
-|----------|-------------|---------|
-| `--quay-auth FILE` | Authentication file for quay.io | `--quay-auth ~/quay-auth.json` |
-| `--operator NAME[,NAME,...]` | Single or comma-separated operator names | `--operator sriov` or `--operator sriov,metallb,nmstate` |
-| OR | | |
-| `--fbc-tag TAG` | Custom FBC tag (single operator only) | `--fbc-tag ocp__4.17__custom-operator` |
-
-**Note:** 
-- Provide either `--operator` OR `--fbc-tag`, not both.
-- Multiple operators can be specified with `--operator` as comma-separated list.
+**Notes:**
+- Multiple operators (`--operator sriov,metallb,nmstate`) only work with the `--operator` flag
 - Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`
-
-### Optional Arguments (Disconnected Mode)
-
-| Argument | Description | Example |
-|----------|-------------|---------|
-| `--internal-registry HOST:PORT` | Internal registry URL | `--internal-registry registry.local:5000` |
-| `--internal-registry-auth FILE` | Auth file for internal registry | `--internal-registry-auth ~/internal-auth.json` |
-
-**Note:** Both `--internal-registry` and `--internal-registry-auth` must be provided together.
+- Disconnected mode requires both `--internal-registry` and `--internal-registry-auth`
+- Script automatically detects mode based on `--internal-registry` presence
 
 ---
 
 ## Multiple Operators Deployment
 
-The script supports deploying multiple operators in a single run, which is optimized for efficiency and time savings.
-
 ### Syntax
-
 ```bash
-./deploy-operator.sh \
-  --operator operator1,operator2,operator3,... \
-  --quay-auth <quay-auth-file> \
-  [--internal-registry <host:port>] \
-  [--internal-registry-auth <internal-auth-file>]
+./deploy-operator.sh --operator sriov,metallb,nmstate,ptp,pfstatus [other-args...]
 ```
 
 ### How It Works
 
-When deploying multiple operators, the script optimizes the process:
-
-1. **Parallel FBC Processing**: Processes all operator FBC images
-2. **Deduplication**: Collects all related images and removes duplicates
-3. **Bulk Mirroring**: Mirrors unique images once (in disconnected mode)
-4. **Batch IDMS Creation**: 
-   - **Loop 1**: Generates all IDMS YAMLs for each operator
-   - **Loop 2**: Applies all IDMS to cluster together
-   - **Single MCP Wait**: Waits for MachineConfigPool update only once (not per operator)
-5. **Sequential Deployment**: Deploys each operator one by one
-6. **Continue on Failure**: If one operator fails, continues with the rest
-7. **Summary Report**: Shows deployment status for all operators
+1. **Parallel FBC Processing**: Script processes FBC metadata for all operators simultaneously
+2. **Deduplication**: Collects `relatedImages` from all operators and removes duplicates
+3. **Bulk Mirroring**: Mirrors unique images once (e.g., 26 images instead of 30 with duplicates)
+4. **Batch IDMS Creation**: Creates separate IDMS for each operator, applies all at once
+5. **Single MCP Wait**: Waits for MachineConfigPool update only once after all IDMS applied
+6. **Sequential Deployment**: Deploys operators one by one
+7. **Continue on Failure**: If one operator fails, continues with remaining operators
+8. **Summary Report**: Shows success/failure status for all operators at the end
 
 ### Benefits
-
-- ⚡ **Faster**: Single MCP update cycle instead of one per operator
-- 🎯 **Efficient**: Unique images mirrored only once
-- 💪 **Resilient**: Failed operator doesn't block others
-- 📊 **Transparent**: Clear summary of successes and failures
+- **Time Savings**: Single MCP wait instead of one per operator (~5-10 minutes saved per operator)
+- **Efficient Mirroring**: Deduplicates images across operators
+- **Resilient**: Continues deploying even if one operator fails
+- **Clear Reporting**: Shows exactly which operators succeeded/failed
 
 ### Examples
 
-#### Deploy All Network Operators (Connected)
-```bash
-./deploy-operator.sh \
-  --operator sriov,metallb,nmstate,ptp,pfstatus \
-  --quay-auth ~/quay-auth.json
-```
-
-#### Deploy Multiple Operators (Disconnected)
+**Connected Mode:**
 ```bash
 ./deploy-operator.sh \
   --operator sriov,metallb,nmstate \
-  --internal-registry registry.local:5000 \
-  --internal-registry-auth ~/internal-auth.json \
-  --quay-auth ~/quay-auth.json
+  --quay-auth /path/to/quay-auth.json
 ```
 
-#### Deploy Two Operators
+**Disconnected Mode:**
 ```bash
 ./deploy-operator.sh \
-  --operator ptp,pfstatus \
-  --quay-auth ~/quay-auth.json
+  --operator sriov,metallb,nmstate,ptp,pfstatus \
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /path/to/internal-auth.json \
+  --quay-auth /path/to/quay-auth.json
 ```
 
-### Example Output
-
+### Example Output (Success)
 ```
-Operators to deploy: sriov metallb nmstate ptp pfstatus
 Mode: Disconnected cluster
-Detected OCP version: 4.20
+Detected OCP version: 4.21
 
-============================================================
-Processing 5 operator(s)
-============================================================
+Processing 5 operators: sriov metallb nmstate ptp pfstatus
+...
 
-Processing operator: sriov
-------------------------------------------------------------
-Mirroring FBC image...
-Extracting metadata from FBC...
-  Operator Name:  sriov-network-operator
-  Bundle:         sriov-network-operator.v4.20.0-202510141524
-  Namespace:      openshift-sriov-network-operator (annotated)
-  Channel:        stable
-  Install Mode:   OwnNamespace
-  Related Images: 11
-
-[... processing metallb, nmstate, ptp, pfstatus ...]
-
-============================================================
-Total unique images across all operators: 26
-============================================================
 Mirroring related images...
-  [1/26] Mirroring sha256:f0c8310d...
+  [1/26] Mirroring sha256:abc123...
     ✓ Success
-  [2/26] Mirroring sha256:a6c0a255...
+  [2/26] Mirroring sha256:def456...
     ✓ Success
-[... continues for all 26 unique images ...]
+  ...
 Successfully mirrored all 26 images
 
 Generating IDMS for each operator...
   Generating IDMS: sriov-internal-idms
   Generating IDMS: metallb-internal-idms
-  Generating IDMS: nmstate-internal-idms
-  Generating IDMS: ptp-internal-idms
-  Generating IDMS: pfstatus-internal-idms
+  ...
 
 Applying all IDMS to cluster...
   Applying IDMS: sriov-internal-idms
   Applying IDMS: metallb-internal-idms
-  Applying IDMS: nmstate-internal-idms
-  Applying IDMS: ptp-internal-idms
-  Applying IDMS: pfstatus-internal-idms
+  ...
 
 Waiting for MachineConfigPool to update (once for all operators)...
 
@@ -323,11 +341,11 @@ Deploying operator: sriov
   Creating Namespace...
   Creating OperatorGroup...
   Creating Subscription...
-  Waiting for CSV sriov-network-operator.v4.20.0-202510141524...
+  Waiting for CSV sriov-operator.v4.21.0-202510151152...
   Waiting for operator pods...
   ✓ Operator sriov deployed successfully
 
-[... continues for metallb, nmstate, ptp, pfstatus ...]
+...
 
 ============================================================
 Deployment Summary
@@ -338,625 +356,327 @@ All operators deployed successfully!
 ============================================================
 ```
 
-### Failure Handling Example
-
-If one operator fails, the script continues with others:
-
+### Example Output (With Failure)
 ```
-Deploying operator: sriov
-------------------------------------------------------------
-  Creating CatalogSource...
-  ERROR: CatalogSource apply failed for sriov
-  ✗ Operator sriov deployment failed, continuing with next operator...
-
-Deploying operator: metallb
-------------------------------------------------------------
-  Creating CatalogSource...
-  Creating Namespace...
-  [... continues successfully ...]
-  ✓ Operator metallb deployed successfully
-
-[... continues with remaining operators ...]
-
 ============================================================
 Deployment Summary
 ============================================================
-Successfully deployed (4): metallb nmstate ptp pfstatus
-Failed to deploy (1): sriov
+Successfully deployed (3): sriov metallb nmstate
+Failed to deploy (2): ptp pfstatus
 
 Deployment completed with errors!
 ============================================================
 ```
 
-The script will exit with code 1 if any operators failed, but only after attempting to deploy all of them.
-
 ---
 
 ## Connected Cluster Examples
 
-### Deploy SR-IOV Operator
+### Deploy Single Operator
 ```bash
 ./deploy-operator.sh \
   --operator sriov \
-  --quay-auth /path/to/quay-auth.json
-```
-
-**What happens:**
-1. Detects OCP version automatically (e.g., 4.17)
-2. Updates cluster pull-secret with quay.io credentials
-3. Uses FBC image: `quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:ocp__4.17__ose-sriov-network-rhel9-operator`
-4. Extracts operator metadata from FBC bundle
-5. Creates IDMS mapping images to `quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share`
-6. Waits for MCP updates
-7. Creates CatalogSource, OperatorGroup, Subscription
-8. Waits for CSV and operator pods to be ready
-
-### Deploy MetalLB Operator
-```bash
-./deploy-operator.sh \
-  --operator metallb \
-  --quay-auth ~/auth/quay-pull-secret.json
-```
-
-### Deploy NMState Operator
-```bash
-./deploy-operator.sh \
-  --operator nmstate \
-  --quay-auth ~/.docker/quay-auth.json
-```
-
-### Deploy PTP Operator
-```bash
-./deploy-operator.sh \
-  --operator ptp \
-  --quay-auth /tmp/quay-auth.json
-```
-
-### Deploy PF Status Operator
-```bash
-./deploy-operator.sh \
-  --operator pfstatus \
   --quay-auth /root/quay-auth.json
 ```
 
-### Deploy Custom Operator with FBC Tag
+### Deploy Multiple Operators
 ```bash
 ./deploy-operator.sh \
-  --fbc-tag ocp__4.17__my-custom-rhel9-operator \
-  --quay-auth /path/to/quay-auth.json
+  --operator sriov,metallb,nmstate \
+  --quay-auth /root/quay-auth.json
 ```
+
+**Expected Flow:**
+1. Script detects connected mode (no `--internal-registry`)
+2. Updates cluster pull-secret with quay.io credentials
+3. Processes FBC metadata for all operators
+4. Creates IDMS per operator (mapping `registry.redhat.io` → `quay.io`)
+5. Applies all IDMS
+6. Waits for MCP update once
+7. Deploys operators sequentially
 
 ---
 
 ## Disconnected Cluster Examples
 
-### Deploy SR-IOV Operator (Disconnected)
-```bash
-./deploy-operator.sh \
-  --operator sriov \
-  --internal-registry registry.internal.example.com:5000 \
-  --internal-registry-auth /path/to/internal-auth.json \
-  --quay-auth /path/to/quay-auth.json
-```
-
-**What happens:**
-1. Detects OCP version automatically
-2. Authenticates to quay.io using provided credentials
-3. Authenticates to internal registry
-4. Mirrors FBC image to internal registry
-5. Extracts operator metadata from FBC bundle
-6. Mirrors all related images to internal registry
-7. Creates IDMS mapping to internal registry
-8. Waits for MCP updates
-9. Configures insecure registry
-10. Waits for MCP updates again
-11. Deploys operator from internal registry
-
-### Deploy MetalLB (Disconnected)
+### Deploy Single Operator
 ```bash
 ./deploy-operator.sh \
   --operator metallb \
-  --internal-registry mirror.corp.com:443 \
-  --internal-registry-auth ~/internal-registry-auth.json \
-  --quay-auth ~/quay-auth.json
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /root/internal-auth.json \
+  --quay-auth /root/quay-auth.json
 ```
 
-### Deploy NMState with IP Registry
+### Deploy Multiple Operators
 ```bash
 ./deploy-operator.sh \
-  --operator nmstate \
-  --internal-registry 192.168.1.100:5000 \
-  --internal-registry-auth /root/auth/internal-auth.json \
-  --quay-auth /root/auth/quay-auth.json
+  --operator sriov,metallb,nmstate,ptp,pfstatus \
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /root/internal-auth.json \
+  --quay-auth /root/quay-auth.json
 ```
 
-### Deploy PTP with Custom Port
-```bash
-./deploy-operator.sh \
-  --operator ptp \
-  --internal-registry registry.airgap.local:8443 \
-  --internal-registry-auth /etc/auth/internal.json \
-  --quay-auth /etc/auth/quay.json
-```
-
-### Deploy Custom Operator using FBC Tag (Disconnected)
-```bash
-./deploy-operator.sh \
-  --fbc-tag ocp__4.16__custom-rhel9-operator \
-  --internal-registry registry.private:5000 \
-  --internal-registry-auth /opt/auth/internal.json \
-  --quay-auth /opt/auth/quay.json
-```
+**Expected Flow:**
+1. Script detects disconnected mode (`--internal-registry` provided)
+2. Mirrors FBC images to internal registry for all operators
+3. Extracts `relatedImages` from all FBC catalogs
+4. Deduplicates images across operators
+5. Mirrors unique images to internal registry
+6. Configures internal registry as insecure
+7. Creates IDMS per operator (mapping `registry.redhat.io` → internal registry)
+8. Applies all IDMS
+9. Waits for MCP update once
+10. Deploys operators sequentially
 
 ---
 
 ## Authentication Files
 
-### Quay Auth File Format
+Authentication files should be in Docker/Podman JSON format:
 
-The script supports auth files with **multiple registry entries** and automatically selects the most specific one.
-
-**Simple format:**
+### Single Registry Example
 ```json
 {
   "auths": {
     "quay.io": {
-      "auth": "base64EncodedUsername:Password=="
+      "auth": "base64-encoded-credentials"
     }
   }
 }
 ```
 
-**With specific registry path (recommended):**
-```json
-{
-  "auths": {
-    "quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share": {
-      "auth": "base64EncodedUsername:Password=="
-    }
-  }
-}
-```
-
-**Multiple registries in one file:**
+### Multiple Registries in One File
 ```json
 {
   "auths": {
     "quay.io": {
-      "auth": "base64EncodedGeneralQuayAuth=="
-    },
-    "quay.io/redhat-user-workloads": {
-      "auth": "base64EncodedWorkloadsAuth=="
+      "auth": "base64-general-quay-credentials"
     },
     "quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share": {
-      "auth": "base64EncodedSpecificAuth=="
+      "auth": "base64-specific-repo-credentials"
     },
-    "registry.redhat.io": {
-      "auth": "base64EncodedRedHatAuth=="
-    }
-  }
-}
-```
-> **Note**: The script will use the most specific match (in this case, `art-images-share`)
-
-### Internal Registry Auth File Format
-
-```json
-{
-  "auths": {
-    "registry.internal.example.com:5000": {
-      "auth": "base64EncodedUsername:Password=="
+    "registry.example.com:5000": {
+      "auth": "base64-internal-registry-credentials"
     }
   }
 }
 ```
 
-### Creating Auth Files
-
-From podman login:
-```bash
-# Login to quay.io
-podman login quay.io --authfile=quay-auth.json
-
-# Login to internal registry
-podman login registry.internal:5000 --authfile=internal-auth.json
-```
-
-From username/password:
-```bash
-# Create base64 encoded credentials
-echo -n "username:password" | base64
-
-# Create auth file manually
-cat > quay-auth.json <<EOF
-{
-  "auths": {
-    "quay.io": {
-      "auth": "dXNlcm5hbWU6cGFzc3dvcmQ="
-    }
-  }
-}
-EOF
-```
+**Smart Credential Selection:**
+The script automatically selects the most specific credentials:
+- If auth file has both `quay.io` and `quay.io/redhat-user-workloads/...`, it uses the repository-specific credentials
+- Displays which credentials are being used during execution
 
 ---
 
-## Predefined Operators
+## Features
 
-| Operator Name | CLI Argument | Package Name | Default Namespace |
-|--------------|--------------|--------------|-------------------|
-| SR-IOV Network Operator | `--operator sriov` | `sriov-network-operator` | `openshift-sriov-network-operator` |
-| MetalLB Operator | `--operator metallb` | `metallb-operator` | `openshift-metallb` |
-| NMState Operator | `--operator nmstate` | `kubernetes-nmstate-operator` | `openshift-nmstate` |
-| PTP Operator | `--operator ptp` | `ptp-operator` | `openshift-ptp` |
-| PF Status Relay Operator | `--operator pfstatus` | `pf-status-relay-operator` | Derived from operator name |
+### 1. Smart Quay.io Authentication
 
-**Note:** The script automatically detects the OCP version and uses the appropriate FBC tag.
+**Priority-based Credential Selection:**
+- Script checks for repository-specific credentials first (`quay.io/redhat-user-workloads/...`)
+- Falls back to general domain credentials (`quay.io`) if specific ones not found
+- Displays which credentials are being used:
+  ```
+  Using Quay.io auth for: quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share
+  ```
+
+### 2. Automatic Metadata Extraction
+- **Operator Name**: From bundle's `metadata.name`
+- **Namespace**: From FBC annotation `operatorframework.io/suggested-namespace`
+- **Channel**: From FBC default channel
+- **Install Mode**: From CSV's `installModes` (`AllNamespaces` or `OwnNamespace`)
+- **Bundle Version**: Latest bundle from sorted list
+
+### 3. Intelligent Mode Detection
+Script auto-detects mode based on arguments:
+- **Connected Mode**: When `--internal-registry` is NOT provided
+- **Disconnected Mode**: When `--internal-registry` IS provided
+
+### 4. Multiple Operator Support
+- Deploy multiple operators in one command
+- Deduplicates images across operators
+- Single MCP wait for all operators
+- Continues on individual operator failures
+- Summary report of successes and failures
+
+### 5. Insecure Registry Handling (Disconnected Mode)
+- Automatically adds internal registry to `registries.conf`
+- Patches `image.config.openshift.io` with insecure registry
+- Waits for MachineConfigPool to reconcile
+
+### 6. Error Handling
+Robust error checking at every step with clear error messages.
 
 ---
 
+## Error Handling
 
+The script has two distinct error handling behaviors:
 
-## Common Scenarios
+### Pre-deployment Validation
+The script exits immediately if:
+- Required arguments are missing
+- Authentication fails to Quay.io or internal registry
+- Invalid operator name provided
+- Image mirroring fails (disconnected mode)
+- IDMS creation/application fails
+- MachineConfigPool update fails
 
-### Scenario 1: Development Environment (Connected)
-Quick operator deployment for testing:
-```bash
-./deploy-operator.sh \
-  --operator metallb \
-  --quay-auth ~/dev/quay-auth.json
-```
+**Behavior**: Script terminates and returns non-zero exit code.
 
-### Scenario 2: Production Air-Gapped Cluster
-Secure deployment with mirrored images:
-```bash
-./deploy-operator.sh \
-  --operator sriov \
-  --internal-registry prod-registry.secure.local:5000 \
-  --internal-registry-auth /secure/auth/internal-auth.json \
-  --quay-auth /secure/auth/quay-auth.json
-```
+### Operator Deployment
+When deploying multiple operators, the script:
+- **Continues** deploying remaining operators if one fails
+- **Tracks** which operators succeeded and which failed
+- **Reports** a summary at the end:
+  ```
+  Successfully deployed (3): sriov metallb nmstate
+  Failed to deploy (2): ptp pfstatus
+  ```
+- **Exits** with code 1 if any operator failed, 0 if all succeeded
 
-### Scenario 3: Testing Custom Operator Build
-Deploy custom Konflux-built operator:
-```bash
-./deploy-operator.sh \
-  --fbc-tag ocp__4.17__test-operator-v2 \
-  --quay-auth ~/test-auth.json
-```
-
-### Scenario 4: Multi-Cluster Deployment (Connected)
-Deploy same operator to multiple clusters:
-```bash
-# Cluster 1
-oc login https://cluster1.example.com:6443
-./deploy-operator.sh --operator ptp --quay-auth ~/quay-auth.json
-
-# Cluster 2  
-oc login https://cluster2.example.com:6443
-./deploy-operator.sh --operator ptp --quay-auth ~/quay-auth.json
-```
-
-### Scenario 5: Multi-Cluster Deployment (Disconnected)
-Deploy to multiple air-gapped clusters with different registries:
-```bash
-# Cluster 1
-oc login https://cluster1.airgap.local:6443
-./deploy-operator.sh \
-  --operator nmstate \
-  --internal-registry registry1.airgap.local:5000 \
-  --internal-registry-auth ~/auth/registry1.json \
-  --quay-auth ~/auth/quay.json
-
-# Cluster 2
-oc login https://cluster2.airgap.local:6443
-./deploy-operator.sh \
-  --operator nmstate \
-  --internal-registry registry2.airgap.local:5000 \
-  --internal-registry-auth ~/auth/registry2.json \
-  --quay-auth ~/auth/quay.json
-```
-
-### Scenario 6: Upgrade Existing Operator
-Deploy newer version to same cluster:
-```bash
-# Delete existing deployment
-oc delete namespace openshift-sriov-network-operator
-oc delete catalogsource sriov-konflux -n openshift-marketplace
-
-# Deploy new version
-./deploy-operator.sh \
-  --operator sriov \
-  --quay-auth ~/quay-auth.json
-```
+**Behavior**: Script completes all deployments, provides summary, then exits with appropriate code.
 
 ---
 
 ## Error Examples
 
-### Error: Missing Required Argument
+### Invalid Operator Name (Single)
 ```bash
-./deploy-operator.sh --operator sriov
-```
-**Output:**
-```
-ERROR: --quay-auth is required
+./deploy-operator.sh --operator invalid-op --quay-auth /root/quay-auth.json
+
+ERROR: Invalid operator name 'invalid-op'
+Valid operators: sriov, metallb, nmstate, ptp, pfstatus
 ```
 
-### Error: Both Operator and FBC Tag Provided
+### Invalid Operator in List
 ```bash
-./deploy-operator.sh \
-  --operator sriov \
-  --fbc-tag ocp__4.17__metallb-rhel9-operator \
-  --quay-auth ~/quay-auth.json
-```
-**Output:**
-```
-ERROR: Provide either --operator or --fbc-tag, not both
+./deploy-operator.sh --operator sriov,invalid,metallb --quay-auth /root/quay-auth.json
+
+ERROR: Invalid operator 'invalid' in list
+Valid operators: sriov, metallb, nmstate, ptp, pfstatus
 ```
 
-### Error: Neither Operator nor FBC Tag Provided
+### Missing Internal Registry Auth
 ```bash
-./deploy-operator.sh --quay-auth ~/quay-auth.json
-```
-**Output:**
-```
-ERROR: Provide either --operator or --fbc-tag
+./deploy-operator.sh --operator sriov --internal-registry registry.example.com:5000 --quay-auth /root/quay-auth.json
+
+ERROR: --internal-registry-auth is required when using --internal-registry
 ```
 
-### Error: Incomplete Disconnected Mode Arguments
+### Quay.io Authentication Failure
 ```bash
-./deploy-operator.sh \
-  --operator sriov \
-  --internal-registry registry.local:5000 \
-  --quay-auth ~/quay-auth.json
-```
-**Output:**
-```
-ERROR: Both --internal-registry and --internal-registry-auth must be provided together
-```
+./deploy-operator.sh --operator sriov --quay-auth /root/invalid-auth.json
 
-### Error: Invalid Operator Name
-```bash
-./deploy-operator.sh \
-  --operator invalid-operator \
-  --quay-auth ~/quay-auth.json
-```
-**Output:**
-```
-ERROR: Invalid operator: invalid-operator
-Valid operators: sriov metallb nmstate ptp pfstatus
-```
-
-### Error: Invalid Operator in Multiple Operators List
-```bash
-./deploy-operator.sh \
-  --operator sriov,badname,metallb \
-  --quay-auth ~/quay-auth.json
-```
-**Output:**
-```
-ERROR: Invalid operator: badname
-Valid operators: sriov metallb nmstate ptp pfstatus
-```
-
-### Error: Auth File Not Found
-```bash
-./deploy-operator.sh \
-  --operator sriov \
-  --quay-auth /nonexistent/file.json
-```
-**Output:**
-```
-ERROR: Quay auth file not found
-```
-
-### Error: Invalid JSON in Auth File
-```bash
-./deploy-operator.sh \
-  --operator sriov \
-  --quay-auth ~/broken-auth.json
-```
-**Output:**
-```
-ERROR: Invalid JSON in quay auth
-```
-
-### Error: Cannot Connect to Cluster
-```bash
-# No cluster context or cluster unreachable
-./deploy-operator.sh \
-  --operator sriov \
-  --quay-auth ~/quay-auth.json
-```
-**Output:**
-```
-ERROR: Cannot connect to cluster
+ERROR: Failed to authenticate to quay.io. Check your credentials in /root/invalid-auth.json
 ```
 
 ---
 
 ## Quick Reference
 
-### Connected Cluster Commands
+### Single operator
 
-**Single operator:**
+**Connected cluster:**
 ```bash
-./deploy-operator.sh \
-  --operator <sriov|metallb|nmstate|ptp|pfstatus> \
-  --quay-auth <quay-auth-file>
+./deploy-operator.sh --operator sriov --quay-auth /path/to/quay-auth.json
 ```
 
-**Multiple operators:**
+**Disconnected cluster:**
+```bash
+./deploy-operator.sh \
+  --operator sriov \
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /path/to/internal-auth.json \
+  --quay-auth /path/to/quay-auth.json
+```
+
+### Multiple operators
+
+**Connected cluster:**
+```bash
+./deploy-operator.sh --operator sriov,metallb,nmstate --quay-auth /path/to/quay-auth.json
+```
+
+**Disconnected cluster:**
 ```bash
 ./deploy-operator.sh \
   --operator sriov,metallb,nmstate,ptp,pfstatus \
-  --quay-auth <quay-auth-file>
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /path/to/internal-auth.json \
+  --quay-auth /path/to/quay-auth.json
 ```
 
-**Custom operator:**
+---
+
+## Cleanup Commands
+
+### Remove Single Operator
 ```bash
-./deploy-operator.sh \
-  --fbc-tag <custom-fbc-tag> \
-  --quay-auth <quay-auth-file>
-```
-
-### Disconnected Cluster Commands
-
-**Single operator:**
-```bash
-./deploy-operator.sh \
-  --operator <sriov|metallb|nmstate|ptp|pfstatus> \
-  --internal-registry <host:port> \
-  --internal-registry-auth <internal-auth-file> \
-  --quay-auth <quay-auth-file>
-```
-
-**Multiple operators:**
-```bash
-./deploy-operator.sh \
-  --operator sriov,metallb,nmstate \
-  --internal-registry <host:port> \
-  --internal-registry-auth <internal-auth-file> \
-  --quay-auth <quay-auth-file>
-```
-
-**Custom operator:**
-```bash
-./deploy-operator.sh \
-  --fbc-tag <custom-fbc-tag> \
-  --internal-registry <host:port> \
-  --internal-registry-auth <internal-auth-file> \
-  --quay-auth <quay-auth-file>
-```
-
-### Cleanup Commands
-
-**Remove operator completely:**
-```bash
-# Delete namespace (removes all operator resources)
-oc delete namespace <operator-namespace>
-
-# Delete catalog source
-oc delete catalogsource <catalog-name> -n openshift-marketplace
-
-# Delete IDMS (connected mode)
-oc delete imagedigestmirrorset <operator>-art-idms
-
-# Delete IDMS (disconnected mode)
-oc delete imagedigestmirrorset <operator>-internal-idms
-```
-
-**Example cleanup for SR-IOV:**
-```bash
+# Delete operator namespace
 oc delete namespace openshift-sriov-network-operator
-oc delete catalogsource sriov-konflux -n openshift-marketplace
-oc delete imagedigestmirrorset sriov-art-idms  # or sriov-internal-idms for disconnected
+
+# Delete CatalogSource
+oc delete catalogsource konflux-sriov-catalog -n openshift-marketplace
+
+# Delete IDMS
+oc delete imagedigestmirrorset sriov-internal-idms  # or sriov-art-idms for connected
 ```
 
-**Cleanup multiple operators at once:**
+### Bulk Cleanup for Multiple Operators
 ```bash
 # Delete all operator namespaces
 for op in sriov metallb nmstate ptp pfstatus; do
-  oc delete catalogsource ${op}-konflux -n openshift-marketplace --ignore-not-found
-  oc delete imagedigestmirrorset ${op}-internal-idms --ignore-not-found
+  case $op in
+    sriov) ns="openshift-sriov-network-operator" ;;
+    metallb) ns="metallb-system" ;;
+    nmstate) ns="openshift-nmstate" ;;
+    ptp) ns="openshift-ptp" ;;
+    pfstatus) ns="openshift-pfstatus" ;;
+  esac
+  oc delete namespace $ns --ignore-not-found
 done
 
-# Delete specific namespaces
-oc delete namespace openshift-sriov-network-operator --ignore-not-found
-oc delete namespace metallb-system --ignore-not-found
-oc delete namespace openshift-nmstate --ignore-not-found
-oc delete namespace openshift-ptp --ignore-not-found
-oc delete namespace openshift-pf-status-relay-operator --ignore-not-found
+# Delete all CatalogSources
+oc delete catalogsource konflux-sriov-catalog -n openshift-marketplace --ignore-not-found
+oc delete catalogsource konflux-metallb-catalog -n openshift-marketplace --ignore-not-found
+oc delete catalogsource konflux-nmstate-catalog -n openshift-marketplace --ignore-not-found
+oc delete catalogsource konflux-ptp-catalog -n openshift-marketplace --ignore-not-found
+oc delete catalogsource konflux-pfstatus-catalog -n openshift-marketplace --ignore-not-found
+
+# Delete all IDMS (choose based on your mode)
+# For disconnected:
+oc delete imagedigestmirrorset sriov-internal-idms --ignore-not-found
+oc delete imagedigestmirrorset metallb-internal-idms --ignore-not-found
+oc delete imagedigestmirrorset nmstate-internal-idms --ignore-not-found
+oc delete imagedigestmirrorset ptp-internal-idms --ignore-not-found
+oc delete imagedigestmirrorset pfstatus-internal-idms --ignore-not-found
+
+# For connected:
+oc delete imagedigestmirrorset sriov-art-idms --ignore-not-found
+oc delete imagedigestmirrorset metallb-art-idms --ignore-not-found
+oc delete imagedigestmirrorset nmstate-art-idms --ignore-not-found
+oc delete imagedigestmirrorset ptp-art-idms --ignore-not-found
+oc delete imagedigestmirrorset pfstatus-art-idms --ignore-not-found
 ```
 
 ---
 
-## Additional Resources
+## Version Information
 
-- **OpenShift Documentation**: https://docs.openshift.com/
-- **OLM Documentation**: https://olm.operatorframework.io/
-- **Konflux Documentation**: https://konflux-ci.dev/
-- **Podman Documentation**: https://podman.io/
-
----
-
-## Support & Troubleshooting
-
-### Enable Verbose Output
-Add `set -x` to the script for detailed execution trace:
-```bash
-#!/bin/bash
-set -Eeuo pipefail
-set -x  # Add this line
-```
-
-### Check Prerequisites
-```bash
-oc version
-opm version
-jq --version
-podman version
-```
-
-### Verify Cluster Connectivity
-```bash
-oc cluster-info
-oc get clusterversion
-```
-
-### Check Authentication
-```bash
-# Test quay.io authentication
-podman login --authfile=quay-auth.json quay.io
-
-# Test internal registry authentication
-podman login --authfile=internal-auth.json registry.internal:5000
-```
-
-### Monitor Operator Deployment
-```bash
-# Watch catalog source
-oc get catalogsource -n openshift-marketplace -w
-
-# Watch subscription
-oc get subscription -n <operator-namespace> -w
-
-# Watch CSV (ClusterServiceVersion)
-oc get csv -n <operator-namespace> -w
-
-# Watch operator pods
-oc get pods -n <operator-namespace> -w
-```
-
-### Check IDMS Status
-```bash
-# List all IDMS
-oc get imagedigestmirrorset
-
-# View specific IDMS
-oc get imagedigestmirrorset <idms-name> -o yaml
-```
-
-### Check MCP Status
-```bash
-# View MachineConfigPool status
-oc get mcp
-
-# Watch MCP updates
-oc get mcp -w
-```
-
----
-
-**Script Version**: 3.0  
-**Last Updated**: October 2025  
-**Supported OCP Versions**: 4.10+
+**Version**: 3.0  
+**Last Updated**: October 2025
 
 ### What's New in v3.0
-- ✅ **Multiple Operators Deployment**: Deploy multiple operators in single run with comma-separated list
-- ✅ **Optimized IDMS Creation**: Batch IDMS generation and application to minimize MCP restarts
-- ✅ **Continue on Failure**: Failed operator doesn't block others, provides deployment summary
-- ✅ **Smart Quay Authentication**: Priority-based credential selection from auth file
-- ✅ **Merged Auth for Mirroring**: Combines quay and internal registry auth for efficient image mirroring
-- ✅ **Better Error Reporting**: Detailed error messages with context for troubleshooting
+- ✅ Multiple operators deployment support (`--operator sriov,metallb,nmstate`)
+- ✅ Smart credential selection from auth files (repository-specific vs general domain)
+- ✅ Credential visibility (displays which auth is being used)
+- ✅ Image deduplication across operators
+- ✅ Single MCP wait for all operators
+- ✅ Batch IDMS creation and application
+- ✅ Continue-on-failure for operator deployments
+- ✅ Deployment summary reporting
+- ✅ Operator validation against predefined list
+- ✅ Enhanced error messages and debugging output
