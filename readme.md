@@ -201,7 +201,7 @@ The script follows these steps when deploying an operator:
 | `--fbc-tag <tag>` | Custom FBC image tag (e.g., `ocp__4.20__metallb-rhel9-operator`). Alternative to `--operator` for advanced usage | Yes* |
 | `--internal-registry <host:port>` | Internal registry location (enables disconnected mode) | No |
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
-| `--quay-auth <file>` | Quay.io authentication file | Yes |
+| `--quay-auth <file>` | Quay.io authentication file | Conditional |
 | `--mcp-timeout <duration>` | Timeout duration for MachineConfigPool updates (e.g., `600s`). Default: `600s` | No |
 
 **Notes:**
@@ -211,6 +211,7 @@ The script follows these steps when deploying an operator:
 - Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`
 - Disconnected mode requires both `--internal-registry` and `--internal-registry-auth`
 - Script automatically detects mode based on `--internal-registry` presence
+- `--quay-auth` is required for disconnected mode, optional for connected mode if cluster's pull-secret already contains auth for quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share repository
 - For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
 
 ---
@@ -221,10 +222,14 @@ The script follows these steps when deploying an operator:
 
 **Predefined Telco Operators:**
 ```bash
-# Single operator
+# Single operator (with quay-auth)
 ./deploy-operator.sh \
   --operator sriov \
   --quay-auth /path/to/quay-auth.json
+
+# Single operator (using cluster's existing pull-secret auth)
+./deploy-operator.sh \
+  --operator sriov
 
 # Multiple operators
 ./deploy-operator.sh \
@@ -234,9 +239,14 @@ The script follows these steps when deploying an operator:
 
 **Custom FBC Tag:**
 ```bash
+# With quay-auth
 ./deploy-operator.sh \
   --fbc-tag ocp__4.20__metallb-rhel9-operator \
   --quay-auth /path/to/quay-auth.json
+
+# Using cluster's existing pull-secret auth
+./deploy-operator.sh \
+  --fbc-tag ocp__4.20__metallb-rhel9-operator
 ```
 
 **Custom MCP Timeout (for larger clusters):**

@@ -46,8 +46,9 @@ else
     OPERATORS=()
 fi
 
-if [[ -z "${QUAY_AUTH:-}" ]]; then
-    echo "ERROR: --quay-auth is required" >&2
+# Check if quay-auth is required for disconnected clusters
+if [[ -n "${INTERNAL_REGISTRY:-}" && -z "${QUAY_AUTH:-}" ]]; then
+    echo "ERROR: --quay-auth is required for disconnected clusters" >&2
     exit 1
 fi
 
@@ -70,8 +71,11 @@ for cmd in oc opm jq podman; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: $cmd not installed" >&2; exit 1; }
 done
 
-[[ ! -f "$QUAY_AUTH" ]] && { echo "ERROR: Quay auth file not found" >&2; exit 1; }
-jq empty "$QUAY_AUTH" 2>/dev/null || { echo "ERROR: Invalid JSON in quay auth" >&2; exit 1; }
+# Only validate quay auth file if provided
+if [[ -n "${QUAY_AUTH:-}" ]]; then
+    [[ ! -f "$QUAY_AUTH" ]] && { echo "ERROR: Quay auth file not found" >&2; exit 1; }
+    jq empty "$QUAY_AUTH" 2>/dev/null || { echo "ERROR: Invalid JSON in quay auth" >&2; exit 1; }
+fi
 
 if [[ "$DISCONNECTED" == true ]]; then
     [[ ! -f "$INTERNAL_REGISTRY_AUTH" ]] && { echo "ERROR: Internal registry auth file not found" >&2; exit 1; }
@@ -185,37 +189,39 @@ if [[ "$DISCONNECTED" == true ]]; then
         podman login --authfile="$INTERNAL_REGISTRY_AUTH" "$INTERNAL_REGISTRY" >/dev/null 2>&1
     fi || { echo "ERROR: Failed to auth internal registry" >&2; exit 1; }
 else
-    current_pull_secret=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
-    quay_auth_content=$(cat "$QUAY_AUTH")
-    
-    # Create a temporary file for the merged auth
-    merged_auth_file=$(mktemp)
-    
-    # Merge auth entries, only adding new ones that don't exist
-    echo "$current_pull_secret" "$quay_auth_content" | jq -s '
-        def merge_unique:
-            reduce .[] as $item (
-                {};
-                . * ($item | if type == "object" then merge_unique else . end)
-            );
-        .[0].auths as $current |
-        .[1].auths as $new |
-        {
-            auths: ($current + $new | merge_unique)
-        }
-    ' > "$merged_auth_file"
-    
-    # Apply the merged auth
-    if ! cmp -s <(echo "$current_pull_secret" | jq -S) "$merged_auth_file"; then
-        cat "$merged_auth_file" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
-            { echo "ERROR: Failed to update cluster pull-secret" >&2; rm -f "$merged_auth_file"; exit 1; }
-        echo "Updated cluster pull-secret with quay.io credentials"
-    else
-        echo "Pull-secret already contains all required quay.io credentials"
+    if [[ -n "${QUAY_AUTH:-}" ]]; then
+        current_pull_secret=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+        quay_auth_content=$(cat "$QUAY_AUTH")
+        
+        # Create a temporary file for the merged auth
+        merged_auth_file=$(mktemp)
+        
+        # Merge auth entries, only adding new ones that don't exist
+        echo "$current_pull_secret" "$quay_auth_content" | jq -s '
+            def merge_unique:
+                reduce .[] as $item (
+                    {};
+                    . * ($item | if type == "object" then merge_unique else . end)
+                );
+            .[0].auths as $current |
+            .[1].auths as $new |
+            {
+                auths: ($current + $new | merge_unique)
+            }
+        ' > "$merged_auth_file"
+        
+        # Apply the merged auth
+        if ! cmp -s <(echo "$current_pull_secret" | jq -S) "$merged_auth_file"; then
+            cat "$merged_auth_file" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
+                { echo "ERROR: Failed to update cluster pull-secret" >&2; rm -f "$merged_auth_file"; exit 1; }
+            echo "Updated cluster pull-secret with quay.io credentials"
+        else
+            echo "Pull-secret already contains all required quay.io credentials"
+        fi
+        
+        # Cleanup
+        rm -f "$merged_auth_file"
     fi
-    
-    # Cleanup
-    rm -f "$merged_auth_file"
 fi
 
 # Mirror FBC images and extract metadata
