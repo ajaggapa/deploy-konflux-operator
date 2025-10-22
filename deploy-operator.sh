@@ -187,10 +187,35 @@ if [[ "$DISCONNECTED" == true ]]; then
 else
     current_pull_secret=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
     quay_auth_content=$(cat "$QUAY_AUTH")
-    merged_auth=$(echo "$current_pull_secret" "$quay_auth_content" | jq -s '.[0].auths * .[1].auths | {auths: .}')
-    echo "$merged_auth" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
-        { echo "ERROR: Failed to update cluster pull-secret" >&2; exit 1; }
-    echo "Updated cluster pull-secret with quay.io credentials"
+    
+    # Create a temporary file for the merged auth
+    merged_auth_file=$(mktemp)
+    
+    # Merge auth entries, only adding new ones that don't exist
+    echo "$current_pull_secret" "$quay_auth_content" | jq -s '
+        def merge_unique:
+            reduce .[] as $item (
+                {};
+                . * ($item | if type == "object" then merge_unique else . end)
+            );
+        .[0].auths as $current |
+        .[1].auths as $new |
+        {
+            auths: ($current + $new | merge_unique)
+        }
+    ' > "$merged_auth_file"
+    
+    # Apply the merged auth
+    if ! cmp -s <(echo "$current_pull_secret" | jq -S) "$merged_auth_file"; then
+        cat "$merged_auth_file" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
+            { echo "ERROR: Failed to update cluster pull-secret" >&2; rm -f "$merged_auth_file"; exit 1; }
+        echo "Updated cluster pull-secret with quay.io credentials"
+    else
+        echo "Pull-secret already contains all required quay.io credentials"
+    fi
+    
+    # Cleanup
+    rm -f "$merged_auth_file"
 fi
 
 # Mirror FBC images and extract metadata
