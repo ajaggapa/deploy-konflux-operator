@@ -666,6 +666,15 @@ EOF
             fi
         fi
         
+        # Wait for subscription to get currentCSV
+        if [[ "$deployment_failed" == false ]]; then
+            echo "  Waiting for subscription to resolve..."
+            if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${operator_name}" -n "${operator_namespace}" --timeout=120s 2>/dev/null; then
+                echo "  ERROR: Subscription did not resolve within timeout" >&2
+                deployment_failed=true
+            fi
+        fi
+        
         # Wait for CSV
         if [[ "$deployment_failed" == false ]]; then
             echo "  Waiting for CSV ${latest_bundle}..."
@@ -795,6 +804,13 @@ spec:
   source: $CATALOG_NAME
   sourceNamespace: openshift-marketplace
 EOF
+    
+    # Wait for subscription to get currentCSV
+    echo "Waiting for subscription to resolve..."
+    if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${OPERATOR_NAME}" -n "${OPERATOR_NAMESPACE}" --timeout=120s 2>/dev/null; then
+        echo "ERROR: Subscription did not resolve within timeout" >&2
+        exit 1
+    fi
     
     # Wait for CSV
     echo "Waiting for CSV ${latest_bundle} to be created..."
