@@ -320,18 +320,59 @@ else
         merged_auth_file=$(mktemp)
         
         # Merge auth entries, only adding new ones that don't exist
-        echo "$current_pull_secret" "$quay_auth_content" | jq -s '
-            def merge_unique:
-                reduce .[] as $item (
-                    {};
-                    . * ($item | if type == "object" then merge_unique else . end)
-                );
+        # Create temporary files for the JSON inputs
+        current_auth_file=$(mktemp)
+        quay_auth_file=$(mktemp)
+        echo "$current_pull_secret" > "$current_auth_file"
+        echo "$quay_auth_content" > "$quay_auth_file"
+        
+        # Debug: Check the content of the files
+        log "INFO" "Debugging JSON inputs..."
+        log "INFO" "Current pull-secret file size: $(wc -c < "$current_auth_file") bytes"
+        log "INFO" "Quay auth file size: $(wc -c < "$quay_auth_file") bytes"
+        
+        # Validate JSON inputs before merging
+        if ! jq empty "$current_auth_file" 2>/dev/null; then
+            log "ERROR" "Current pull-secret is not valid JSON"
+            log "ERROR" "First 200 chars of current pull-secret: $(head -c 200 "$current_auth_file")"
+            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
+            exit 1
+        fi
+        
+        if ! jq empty "$quay_auth_file" 2>/dev/null; then
+            log "ERROR" "Quay auth content is not valid JSON"
+            log "ERROR" "First 200 chars of quay auth: $(head -c 200 "$quay_auth_file")"
+            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
+            exit 1
+        fi
+        
+        # Check if both files have the expected structure
+        if ! jq -e '.auths' "$current_auth_file" >/dev/null 2>&1; then
+            log "ERROR" "Current pull-secret does not contain 'auths' field"
+            log "ERROR" "Current pull-secret structure: $(jq keys "$current_auth_file" 2>/dev/null || echo 'Invalid JSON')"
+            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
+            exit 1
+        fi
+        
+        if ! jq -e '.auths' "$quay_auth_file" >/dev/null 2>&1; then
+            log "ERROR" "Quay auth does not contain 'auths' field"
+            log "ERROR" "Quay auth structure: $(jq keys "$quay_auth_file" 2>/dev/null || echo 'Invalid JSON')"
+            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
+            exit 1
+        fi
+        
+        log "INFO" "Both JSON files are valid and contain 'auths' fields"
+        
+        jq -s '
             .[0].auths as $current |
             .[1].auths as $new |
             {
-                auths: ($current + $new | merge_unique)
+                auths: ($current + $new)
             }
-        ' > "$merged_auth_file"
+        ' "$current_auth_file" "$quay_auth_file" > "$merged_auth_file"
+        
+        # Cleanup temporary files
+        rm -f "$current_auth_file" "$quay_auth_file"
         
         # Apply the merged auth
         log "INFO" "Comparing current and updated pull-secret..."
