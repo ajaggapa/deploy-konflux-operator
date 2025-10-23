@@ -1038,18 +1038,18 @@ EOF
     
     # Wait for CSV
     log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-    oc wait --for=create csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=90s 2>/dev/null || \
+    oc wait --for=create csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
         { log "WARNING" "CSV ${latest_bundle} was not created within timeout"; }
     log "SUCCESS" "CSV created"
     
     log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
-    oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=120s 2>/dev/null || \
+    oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
         { log "WARNING" "CSV ${latest_bundle} did not reach Succeeded phase within timeout"; }
     log "SUCCESS" "CSV reached Succeeded phase"
     
     # Wait for operator pods
     log "INFO" "Waiting for operator pods to be ready..."
-    oc wait --for=condition=Ready pods --all -n "$OPERATOR_NAMESPACE" --timeout=120s 2>/dev/null || \
+    oc wait --for=condition=Ready pods --all -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
         { log "WARNING" "Operator pods did not reach Ready state within timeout"; }
     log "SUCCESS" "All operator pods are ready"
 fi
