@@ -171,10 +171,21 @@ fi
 
 log "INFO" "Checking required tools"
 
-for cmd in oc opm jq podman; do
+# Check core tools (always required)
+for cmd in oc opm jq; do
     log "INFO" "Checking for $cmd..."
     command -v "$cmd" >/dev/null 2>&1 || { log "ERROR" "$cmd not installed"; exit 1; }
 done
+
+# Check podman (required for disconnected clusters or when quay-auth is provided)
+if [[ "$DISCONNECTED" == true ]] || [[ -n "${QUAY_AUTH:-}" ]]; then
+    log "INFO" "Checking for podman (required for registry authentication)..."
+    command -v "podman" >/dev/null 2>&1 || { log "ERROR" "podman not installed (required for registry authentication)"; exit 1; }
+    log "SUCCESS" "podman is available"
+else
+    log "INFO" "Skipping podman check (not needed for connected clusters without quay-auth)"
+fi
+
 log "SUCCESS" "All required tools are available"
 
 log "INFO" "Validating authentication files"
