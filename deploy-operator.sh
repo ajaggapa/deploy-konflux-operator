@@ -419,8 +419,16 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
         # Mirror FBC image if disconnected
         if [[ "$DISCONNECTED" == true ]]; then
             echo "Mirroring FBC image..."
-            oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" || \
-                { echo "ERROR: Failed to mirror FBC for $op" >&2; exit 1; }
+            mirror_output=$(oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" 2>&1)
+            mirror_status=$?
+            if [[ $mirror_status -ne 0 ]]; then
+                echo "ERROR: Failed to mirror FBC for $op" >&2
+                echo "Source: $fbc_source" >&2
+                echo "Target: $fbc_target" >&2
+                echo "Error output:" >&2
+                echo "$mirror_output" >&2
+                exit 1
+            fi
         fi
         
         # Extract metadata from FBC
@@ -510,11 +518,18 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
             source="${ART_IMAGES_SOURCE}@${digest}"
             target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
             
-            if oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>/dev/null; then
+            mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1)
+            mirror_status=$?
+            if [[ $mirror_status -eq 0 ]]; then
                 echo "    ✓ Success"
             else
                 set -e  # Re-enable exit on error
                 echo "ERROR: Failed to mirror $digest" >&2
+                echo "Source: $source" >&2
+                echo "Target: $target" >&2
+                echo "Digest: $digest" >&2
+                echo "Error output:" >&2
+                echo "$mirror_output" >&2
                 rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
                 exit 1
             fi
@@ -534,8 +549,16 @@ else
     if [[ "$DISCONNECTED" == true ]]; then
         log "INFO" "Mirroring FBC image for disconnected cluster..."
         fbc_target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
-        oc image mirror --keep-manifest-list=true "$FBC_SOURCE_IMAGE" "$fbc_target" || \
-            { log "ERROR" "Failed to mirror FBC"; exit 1; }
+        mirror_output=$(oc image mirror --keep-manifest-list=true "$FBC_SOURCE_IMAGE" "$fbc_target" 2>&1)
+        mirror_status=$?
+        if [[ $mirror_status -ne 0 ]]; then
+            log "ERROR" "Failed to mirror FBC"
+            log "ERROR" "Source: $FBC_SOURCE_IMAGE"
+            log "ERROR" "Target: $fbc_target"
+            log "ERROR" "Error output:"
+            echo "$mirror_output" >&2
+            exit 1
+        fi
         log "SUCCESS" "FBC image mirrored successfully"
     else
         fbc_target="${FBC_SOURCE_IMAGE}"
