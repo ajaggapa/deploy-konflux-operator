@@ -459,17 +459,19 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
         OPERATOR_CHANNELS[$op]="$default_channel"
         OPERATOR_INSTALL_MODES[$op]="$install_mode"
         
-        # Print metadata
-        echo "  Operator Name:  $operator_name"
-        echo "  Bundle:         $latest_bundle"
-        echo "  Namespace:      $operator_namespace ($namespace_source)"
-        echo "  Channel:        $default_channel"
-        echo "  Install Mode:   $install_mode"
+        # Print metadata using display_metadata function
+        {
+            echo "Operator Name:    $operator_name"
+            echo "Bundle Name:      $latest_bundle"
+            echo "Namespace:        $operator_namespace ($namespace_source)"
+            echo "Channel:          $default_channel"
+            echo "Install Mode:     $install_mode"
+            echo ""
+            echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u | nl -w2 -s'. '
+        } | display_metadata
         
         # Collect related images to temp file
         echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' 2>/dev/null | grep -v '^$' >> "$ALL_IMAGES_FILE"
-        
-        echo "  Related Images: $(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | wc -l)"
     done
     
     # Calculate total unique images
