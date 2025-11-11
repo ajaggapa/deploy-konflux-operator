@@ -920,7 +920,18 @@ EOF
         # Wait for CSV
         if [[ "$deployment_failed" == false ]]; then
             log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-            if ! oc wait --for=create csv "$latest_bundle" -n "$operator_namespace" --timeout=90s 2>/dev/null; then
+            local csv_timeout=180
+            local csv_elapsed=0
+            local csv_created=false
+            while [[ $csv_elapsed -lt $csv_timeout ]]; do
+                if oc get csv "$latest_bundle" -n "$operator_namespace" >/dev/null 2>&1; then
+                    csv_created=true
+                    break
+                fi
+                sleep 2
+                csv_elapsed=$((csv_elapsed + 2))
+            done
+            if [[ "$csv_created" == false ]]; then
                 log "ERROR" "CSV ${latest_bundle} not created within timeout"
                 deployment_failed=true
             else
@@ -1074,9 +1085,22 @@ EOF
     
     # Wait for CSV
     log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-    oc wait --for=create csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
-        { log "WARNING" "CSV ${latest_bundle} was not created within timeout"; }
-    log "SUCCESS" "CSV created"
+    local csv_timeout=180
+    local csv_elapsed=0
+    local csv_created=false
+    while [[ $csv_elapsed -lt $csv_timeout ]]; do
+        if oc get csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" >/dev/null 2>&1; then
+            csv_created=true
+            break
+        fi
+        sleep 2
+        csv_elapsed=$((csv_elapsed + 2))
+    done
+    if [[ "$csv_created" == false ]]; then
+        log "WARNING" "CSV ${latest_bundle} was not created within timeout"
+    else
+        log "SUCCESS" "CSV created"
+    fi
     
     log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
     oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
