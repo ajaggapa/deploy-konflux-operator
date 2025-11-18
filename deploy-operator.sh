@@ -920,9 +920,9 @@ EOF
         # Wait for CSV
         if [[ "$deployment_failed" == false ]]; then
             log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-            local csv_timeout=180
-            local csv_elapsed=0
-            local csv_created=false
+            csv_timeout=180
+            csv_elapsed=0
+            csv_created=false
             while [[ $csv_elapsed -lt $csv_timeout ]]; do
                 if oc get csv "$latest_bundle" -n "$operator_namespace" >/dev/null 2>&1; then
                     csv_created=true
@@ -1085,9 +1085,9 @@ EOF
     
     # Wait for CSV
     log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-    local csv_timeout=180
-    local csv_elapsed=0
-    local csv_created=false
+    csv_timeout=180
+    csv_elapsed=0
+    csv_created=false
     while [[ $csv_elapsed -lt $csv_timeout ]]; do
         if oc get csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" >/dev/null 2>&1; then
             csv_created=true
