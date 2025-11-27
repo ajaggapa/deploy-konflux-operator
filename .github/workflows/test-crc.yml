@@ -188,11 +188,29 @@ jobs:
 
       - name: Install CRC
         run: |
-          CRC_VERSION=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json | jq -r '.version')
+          CRC_INFO=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json)
+          CRC_VERSION=$(echo "$CRC_INFO" | jq -r '.version.crcVersion // empty')
+          
+          if [ -z "$CRC_VERSION" ] || [ "$CRC_VERSION" = "null" ]; then
+            echo "ERROR: Could not extract CRC version from release info"
+            echo "Release info: $CRC_INFO"
+            exit 1
+          fi
+          
           echo "Installing CRC version: $CRC_VERSION"
           
           wget -q "https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/crc/${CRC_VERSION}/crc-linux-amd64.tar.xz"
+          if [ ! -f "crc-linux-amd64.tar.xz" ]; then
+            echo "ERROR: Failed to download CRC archive"
+            exit 1
+          fi
+          
           tar -xJf crc-linux-amd64.tar.xz
+          if [ ! -d "crc-linux-"* ]; then
+            echo "ERROR: Failed to extract CRC archive"
+            exit 1
+          fi
+          
           sudo mv crc-linux-*/crc /usr/local/bin/
           rm -rf crc-linux-* crc-linux-amd64.tar.xz
           
