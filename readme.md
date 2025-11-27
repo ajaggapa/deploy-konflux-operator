@@ -198,7 +198,7 @@ The script follows these steps when deploying an operator:
 | Argument | Description | Required |
 |----------|-------------|----------|
 | `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes* |
-| `--fbc-tag <tag>` | Custom FBC image tag (e.g., `ocp__4.20__metallb-rhel9-operator`). Alternative to `--operator` for advanced usage | Yes* |
+| `--fbc-tag <tag>` | Custom FBC image tag (e.g., `ocp__4.20__metallb-rhel9-operator`). Alternative to `--operator` for advanced usage. Supports comma-separated list: `ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-local-storage-rhel9-operator` | Yes* |
 | `--internal-registry <host:port>` | Internal registry location (enables disconnected mode) | No |
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
 | `--quay-auth <file>` | Quay.io authentication file | Conditional |
@@ -206,13 +206,14 @@ The script follows these steps when deploying an operator:
 
 **Notes:**
 - **Either** `--operator` **or** `--fbc-tag` is required (not both)
-- Multiple operators (`--operator sriov,metallb,nmstate`) only work with the `--operator` flag
-- `--fbc-tag` only accepts a **single tag** (no comma-separated lists)
-- Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`
+- Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`
 - Disconnected mode requires both `--internal-registry` and `--internal-registry-auth`
 - Script automatically detects mode based on `--internal-registry` presence
 - `--quay-auth` is required for disconnected mode, optional for connected mode if cluster's pull-secret already contains auth for quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share repository
 - For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
+- It is possible to skip deployment of the catalog source or operator by setting env variable KONFLUX_DEPLOY_CATALOG_SOURCE=false, or KONFLUX_DEPLOY_OPERATOR=false
+- It is possible to quit the script early by setting KONFLUX_SKIP_DEPLOYMENT=true
+
 
 ---
 
