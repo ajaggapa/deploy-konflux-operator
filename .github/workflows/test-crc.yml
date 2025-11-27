@@ -284,12 +284,18 @@ jobs:
             echo "Please add your pull secret to GitHub secrets."
           fi
           
-          # Start CRC with pull secret
+          # Start CRC with pull secret using runuser to ensure libvirt group is active
           if [ -n "$CRC_PULL_SECRET" ]; then
-            echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt
+            echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' || {
+              echo "Warning: runuser failed, trying direct crc start..."
+              echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt || echo "CRC start failed - continuing anyway"
+            }
           else
-            # Try to start without pull secret (may fail)
-            crc start || echo "CRC start failed - continuing anyway"
+            # Try to start without pull secret using runuser
+            sudo runuser -u $USER -g libvirt -- crc start || {
+              echo "Warning: runuser failed, trying direct crc start..."
+              crc start || echo "CRC start failed - continuing anyway"
+            }
           fi
           
           # Wait for cluster to be ready
