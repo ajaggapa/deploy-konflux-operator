@@ -188,30 +188,62 @@ jobs:
 
       - name: Install CRC
         run: |
-          CRC_INFO=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json)
-          CRC_VERSION=$(echo "$CRC_INFO" | jq -r '.version.crcVersion // empty')
+          # Try to get CRC version from API, with fallback
+          echo "Fetching CRC release information..."
+          CRC_INFO=$(curl -s --max-time 10 --retry 3 https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json || echo "")
           
-          if [ -z "$CRC_VERSION" ] || [ "$CRC_VERSION" = "null" ]; then
-            echo "ERROR: Could not extract CRC version from release info"
-            echo "Release info: $CRC_INFO"
-            exit 1
+          if [ -n "$CRC_INFO" ] && echo "$CRC_INFO" | jq -e '.version.crcVersion' >/dev/null 2>&1; then
+            CRC_VERSION=$(echo "$CRC_INFO" | jq -r '.version.crcVersion')
+            echo "Found CRC version from API: $CRC_VERSION"
+          else
+            # Fallback: try to get latest version from directory listing or use a known working version
+            echo "Could not get version from API, trying fallback method..."
+            # Try to use the links from the API response if available
+            if [ -n "$CRC_INFO" ] && echo "$CRC_INFO" | jq -e '.links.linux' >/dev/null 2>&1; then
+              CRC_URL=$(echo "$CRC_INFO" | jq -r '.links.linux')
+              echo "Using direct download URL from API: $CRC_URL"
+              wget -q "$CRC_URL" -O crc-linux-amd64.tar.xz
+            else
+              # Last resort: try a known recent version
+              echo "Using fallback: trying to download latest CRC directly..."
+              CRC_VERSION="2.56.0"  # Known working version as fallback
+              echo "Using fallback version: $CRC_VERSION"
+              wget -q "https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/crc/${CRC_VERSION}/crc-linux-amd64.tar.xz" || {
+                echo "ERROR: Failed to download CRC archive with fallback version"
+                exit 1
+              }
+            fi
           fi
           
-          echo "Installing CRC version: $CRC_VERSION"
+          # Download if we have a version but haven't downloaded yet
+          if [ -z "$CRC_URL" ] && [ -n "$CRC_VERSION" ]; then
+            echo "Installing CRC version: $CRC_VERSION"
+            wget -q "https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/crc/${CRC_VERSION}/crc-linux-amd64.tar.xz" || {
+              echo "ERROR: Failed to download CRC archive"
+              exit 1
+            }
+          fi
           
-          wget -q "https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/crc/${CRC_VERSION}/crc-linux-amd64.tar.xz"
           if [ ! -f "crc-linux-amd64.tar.xz" ]; then
-            echo "ERROR: Failed to download CRC archive"
+            echo "ERROR: CRC archive file not found after download"
             exit 1
           fi
           
-          tar -xJf crc-linux-amd64.tar.xz
-          if [ ! -d "crc-linux-"* ]; then
+          echo "Extracting CRC archive..."
+          tar -xJf crc-linux-amd64.tar.xz || {
             echo "ERROR: Failed to extract CRC archive"
             exit 1
+          }
+          
+          # Find the extracted directory
+          CRC_DIR=$(find . -maxdepth 1 -type d -name "crc-linux-*" | head -1)
+          if [ -z "$CRC_DIR" ] || [ ! -f "$CRC_DIR/crc" ]; then
+            echo "ERROR: CRC binary not found in extracted archive"
+            ls -la
+            exit 1
           fi
           
-          sudo mv crc-linux-*/crc /usr/local/bin/
+          sudo mv "$CRC_DIR/crc" /usr/local/bin/
           rm -rf crc-linux-* crc-linux-amd64.tar.xz
           
           crc version
