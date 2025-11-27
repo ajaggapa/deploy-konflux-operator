@@ -297,47 +297,89 @@ jobs:
           fi
           
           # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
+          CRC_START_SUCCESS=false
           if [ -n "$CRC_PULL_SECRET" ]; then
-            echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" || {
+            echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
               echo "Warning: sg failed, trying runuser..."
-              echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' || {
+              echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' && CRC_START_SUCCESS=true || {
                 echo "Warning: runuser failed, trying direct crc start..."
-                echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt || echo "CRC start failed - continuing anyway"
+                echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt && CRC_START_SUCCESS=true || {
+                  echo "ERROR: All attempts to start CRC failed!"
+                  echo "Checking CRC status..."
+                  crc status || true
+                  exit 1
+                }
               }
             }
           else
             # Try to start without pull secret using sg libvirt
-            sg libvirt -c "crc start" || {
+            sg libvirt -c "crc start" && CRC_START_SUCCESS=true || {
               echo "Warning: sg failed, trying runuser..."
-              sudo runuser -u $USER -g libvirt -- crc start || {
+              sudo runuser -u $USER -g libvirt -- crc start && CRC_START_SUCCESS=true || {
                 echo "Warning: runuser failed, trying direct crc start..."
-                crc start || echo "CRC start failed - continuing anyway"
+                crc start && CRC_START_SUCCESS=true || {
+                  echo "ERROR: All attempts to start CRC failed!"
+                  echo "Checking CRC status..."
+                  crc status || true
+                  exit 1
+                }
               }
             }
           fi
           
-          # Wait for cluster to be ready
-          timeout 300 bash -c 'until oc get nodes 2>/dev/null; do sleep 10; done' || true
+          if [ "$CRC_START_SUCCESS" = "true" ]; then
+            echo "CRC started successfully!"
+            
+            # Wait for cluster to be ready
+            echo "Waiting for cluster to be ready..."
+            timeout 300 bash -c 'until oc get nodes 2>/dev/null; do sleep 10; done' || {
+              echo "ERROR: Cluster did not become ready within timeout"
+              crc status || true
+              exit 1
+            }
+            
+            # Configure oc environment
+            eval $(crc oc-env)
+            
+            # Login as admin
+            oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify || {
+              echo "ERROR: Failed to login to cluster"
+              exit 1
+            }
+            
+            # Wait for cluster operators to be ready
+            echo "Waiting for cluster operators to be ready..."
+            timeout 600 bash -c 'until oc get clusteroperators 2>/dev/null && oc wait --for=condition=Available --timeout=5s clusteroperators --all 2>/dev/null; do sleep 30; done' || echo "Warning: Cluster operators may not be fully ready"
+          else
+            echo "ERROR: CRC start failed!"
+            exit 1
+          fi
+
+      - name: Verify cluster access
+        run: |
+          # Check if CRC is running
+          if ! crc status &>/dev/null; then
+            echo "ERROR: CRC cluster is not running!"
+            crc status || true
+            exit 1
+          fi
           
           # Configure oc environment
           eval $(crc oc-env)
           
           # Login as admin
-          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify || true
-          
-          # Wait for cluster operators to be ready
-          echo "Waiting for cluster operators to be ready..."
-          timeout 600 bash -c 'until oc get clusteroperators 2>/dev/null && oc wait --for=condition=Available --timeout=5s clusteroperators --all 2>/dev/null; do sleep 30; done' || echo "Cluster operators may not be fully ready"
-
-      - name: Verify cluster access
-        run: |
-          eval $(crc oc-env)
-          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify || {
+            echo "ERROR: Failed to login to cluster"
+            exit 1
+          }
           
           echo "=========================================="
           echo "Cluster Information:"
           echo "=========================================="
-          oc get nodes
+          oc get nodes || {
+            echo "ERROR: Failed to get nodes"
+            exit 1
+          }
           echo ""
           echo "OpenShift Version:"
           oc version -o json | jq -r '.openshiftVersion // "unknown"'
