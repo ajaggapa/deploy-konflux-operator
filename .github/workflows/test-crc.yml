@@ -1,13 +1,15 @@
 name: Test on OpenShift CRC
 
 on:
-  pull_request:
-    branches:
-      - testworkflow
   push:
     branches:
       - testworkflow
+  pull_request:
+    branches:
+      - testworkflow
   workflow_dispatch:
+    branches:
+      - testworkflow
 
 jobs:
   test-crc:
