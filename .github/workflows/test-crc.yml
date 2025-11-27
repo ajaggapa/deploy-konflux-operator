@@ -264,7 +264,8 @@ jobs:
           # Set CRC cache directory to /mnt which has more space (66GB available)
           # This avoids "no space left on device" errors during bundle extraction
           export CRC_CACHE_DIR=/mnt/crc-cache
-          mkdir -p "$CRC_CACHE_DIR"
+          sudo mkdir -p "$CRC_CACHE_DIR"
+          sudo chown -R $USER:$USER "$CRC_CACHE_DIR"
           echo "CRC cache directory set to: $CRC_CACHE_DIR"
           df -h "$CRC_CACHE_DIR"
           
@@ -308,7 +309,8 @@ jobs:
           
           # Set CRC cache directory to /mnt which has more space (66GB available)
           export CRC_CACHE_DIR=/mnt/crc-cache
-          mkdir -p "$CRC_CACHE_DIR"
+          sudo mkdir -p "$CRC_CACHE_DIR"
+          sudo chown -R $USER:$USER "$CRC_CACHE_DIR"
           echo "CRC cache directory set to: $CRC_CACHE_DIR"
           
           # Clean up any incomplete extractions from previous attempts
