@@ -262,18 +262,24 @@ jobs:
           crc config set disk-size 50  # Reduce disk size
           
           # Setup CRC (download and extract bundle)
-          # Use 'runuser' to run as the current user with libvirt group
-          # This works around the group membership check in CRC setup
-          # runuser doesn't require a password and respects group membership
-          sudo runuser -u $USER -g libvirt -- crc setup || {
-            echo "Warning: runuser failed, trying direct crc setup..."
-            # Fallback: try direct setup (may fail on group check)
-            crc setup || {
-              echo "CRC setup failed. Attempting to work around group check..."
-              # Last resort: try to skip group validation by setting environment
-              CRC_SKIP_CHECK_LIBVIRT_GROUP=true crc setup || true
+          # Use 'sg libvirt' to run in libvirt group context (non-interactive)
+          # sg works because user is already in libvirt group (added in Install dependencies)
+          sg libvirt -c "crc setup" || {
+            echo "Warning: sg failed, trying runuser..."
+            sudo runuser -u $USER -g libvirt -- crc setup || {
+              echo "Warning: runuser failed, trying direct crc setup..."
+              crc setup || {
+                echo "CRC setup failed. Attempting to work around group check..."
+                CRC_SKIP_CHECK_LIBVIRT_GROUP=true crc setup || true
+              }
             }
           }
+          
+          # Ensure crc-admin-helper has correct permissions for subsequent steps
+          if [ -f ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
+            sudo chmod 4755 ~/.crc/bin/crc-admin-helper-linux-amd64 || true
+            sudo chown $USER:$USER ~/.crc/bin/crc-admin-helper-linux-amd64 || true
+          fi
 
       - name: Start CRC cluster
         env:
@@ -284,17 +290,29 @@ jobs:
             echo "Please add your pull secret to GitHub secrets."
           fi
           
-          # Start CRC with pull secret using runuser to ensure libvirt group is active
+          # Ensure crc-admin-helper has correct permissions
+          if [ -f ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
+            sudo chmod 4755 ~/.crc/bin/crc-admin-helper-linux-amd64 || true
+            sudo chown $USER:$USER ~/.crc/bin/crc-admin-helper-linux-amd64 || true
+          fi
+          
+          # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
           if [ -n "$CRC_PULL_SECRET" ]; then
-            echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' || {
-              echo "Warning: runuser failed, trying direct crc start..."
-              echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt || echo "CRC start failed - continuing anyway"
+            echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" || {
+              echo "Warning: sg failed, trying runuser..."
+              echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' || {
+                echo "Warning: runuser failed, trying direct crc start..."
+                echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt || echo "CRC start failed - continuing anyway"
+              }
             }
           else
-            # Try to start without pull secret using runuser
-            sudo runuser -u $USER -g libvirt -- crc start || {
-              echo "Warning: runuser failed, trying direct crc start..."
-              crc start || echo "CRC start failed - continuing anyway"
+            # Try to start without pull secret using sg libvirt
+            sg libvirt -c "crc start" || {
+              echo "Warning: sg failed, trying runuser..."
+              sudo runuser -u $USER -g libvirt -- crc start || {
+                echo "Warning: runuser failed, trying direct crc start..."
+                crc start || echo "CRC start failed - continuing anyway"
+              }
             }
           fi
           
