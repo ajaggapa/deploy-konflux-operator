@@ -622,137 +622,136 @@ log "INFO" "Processing ${#DEPLOYMENT_KEYS[@]} operator(s)/FBC tag(s)"
 ALL_IMAGES_FILE=$(mktemp)
 
 for op in "${DEPLOYMENT_KEYS[@]}"; do
-        log "INFO" "Processing operator: $op"
-        
-        fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
-        fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
-        
-        # Mirror FBC image if disconnected
-        if [[ "$DISCONNECTED" == true ]]; then
-            echo "Mirroring FBC image..."
-            mirror_output=$(oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" 2>&1)
-            mirror_status=$?
-            if [[ $mirror_status -ne 0 ]]; then
-                echo "ERROR: Failed to mirror FBC for $op" >&2
-                echo "Source: $fbc_source" >&2
-                echo "Target: $fbc_target" >&2
-                echo "Error output:" >&2
-                echo "$mirror_output" >&2
-                exit 1
-            fi
-        fi
-        
-        # Extract metadata from FBC
-        log "INFO" "Rendering FBC: $fbc_source"
-        opm_output=$(opm render "$fbc_source") || { log "ERROR" "opm render failed for $op"; exit 1; }
-        
-        log "INFO" "Finding latest bundle version..."
-        latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-        [[ -z "$latest_bundle" ]] && { log "ERROR" "No bundle found for $op"; exit 1; }
-        
-        log "INFO" "Extracting bundle data..."
-        bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-        
-        log "INFO" "Extracting operator metadata..."
-        operator_name=$(echo "$bundle_data" | jq -r '.package // empty' | head -1)
-        [[ -z "$operator_name" ]] && { log "ERROR" "Could not extract operator name for $op"; exit 1; }
-        
-        operator_namespace=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' | head -1)
-        if [[ -z "$operator_namespace" ]]; then
-            operator_namespace="openshift-${operator_name}"
-            namespace_source="derived"
-        else
-            namespace_source="annotated"
-        fi
-        
-        default_channel=$(echo "$opm_output" | jq -r 'select(.schema == "olm.package") | .defaultChannel // "stable"' | head -1)
-        [[ -z "$default_channel" ]] && default_channel="stable"
-        
-        install_mode=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.installModes[]? | select(.supported == true) | .type' | head -1)
-        [[ -z "$install_mode" ]] && install_mode="SingleNamespace"
-        
-        # Store metadata
-        OPERATOR_NAMES[$op]="$operator_name"
-        OPERATOR_BUNDLES[$op]="$latest_bundle"
-        OPERATOR_NAMESPACES[$op]="$operator_namespace"
-        OPERATOR_CHANNELS[$op]="$default_channel"
-        OPERATOR_INSTALL_MODES[$op]="$install_mode"
-        
-        # Print metadata using display_metadata function
-        {
-            echo "Operator Name:    $operator_name"
-            echo "Bundle Name:      $latest_bundle"
-            echo "Namespace:        $operator_namespace ($namespace_source)"
-            echo "Channel:          $default_channel"
-            echo "Install Mode:     $install_mode"
-            echo ""
-            echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u | nl -w2 -s'. '
-        } | display_metadata
-        
-        # Collect related images to temp file
-        echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' 2>/dev/null | grep -v '^$' >> "$ALL_IMAGES_FILE"
-    done
+    log "INFO" "Processing operator: $op"
     
-    # Calculate total unique images
-    total_images=$(sort -u "$ALL_IMAGES_FILE" | wc -l)
+    fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
+    fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
     
-    echo ""
-    echo "============================================================"
-    echo "Total unique images across all operators: $total_images"
-    echo "============================================================"
-    
-    # Mirror all related images if disconnected
+    # Mirror FBC image if disconnected
     if [[ "$DISCONNECTED" == true ]]; then
-        # Merge quay and internal auth files for oc image mirror (pull+push)
-        MERGED_AUTH_FILE=$(mktemp)
-        jq -s '{auths: (.[0].auths + .[1].auths)}' "$QUAY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
-            { echo "ERROR: Failed to merge auth files for image mirroring" >&2; rm -f "$MERGED_AUTH_FILE" "$ALL_IMAGES_FILE"; exit 1; }
-        
-        # Sort unique images to a new file (avoids pipefail issues with process substitution)
-        SORTED_IMAGES_FILE=$(mktemp)
-        sort -u "$ALL_IMAGES_FILE" > "$SORTED_IMAGES_FILE"
-        rm -f "$ALL_IMAGES_FILE"
-        
-        echo "Mirroring related images..."
-        image_count=0
-        
-        # Read directly from the sorted file
-        set +e  # Temporarily disable exit on error for the loop
-        while IFS= read -r image; do
-            [[ -z "$image" ]] && continue
-            
-            digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}')
-            [[ -z "$digest" ]] && continue
-            
-            ((image_count++))
-            echo "  [$image_count/$total_images] Mirroring $digest..."
-            source="${ART_IMAGES_SOURCE}@${digest}"
-            target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-            
-            mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1)
-            mirror_status=$?
-            if [[ $mirror_status -eq 0 ]]; then
-                echo "    ✓ Success"
-            else
-                set -e  # Re-enable exit on error
-                echo "ERROR: Failed to mirror $digest" >&2
-                echo "Source: $source" >&2
-                echo "Target: $target" >&2
-                echo "Digest: $digest" >&2
-                echo "Error output:" >&2
-                echo "$mirror_output" >&2
-                rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
-                exit 1
-            fi
-        done < "$SORTED_IMAGES_FILE"
-        set -e  # Re-enable exit on error
-        
-        echo "Successfully mirrored all $image_count images"
-        rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
-    else
-        rm -f "$ALL_IMAGES_FILE"
+        echo "Mirroring FBC image..."
+        mirror_output=$(oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" 2>&1)
+        mirror_status=$?
+        if [[ $mirror_status -ne 0 ]]; then
+            echo "ERROR: Failed to mirror FBC for $op" >&2
+            echo "Source: $fbc_source" >&2
+            echo "Target: $fbc_target" >&2
+            echo "Error output:" >&2
+            echo "$mirror_output" >&2
+            exit 1
+        fi
     fi
+
+    # Extract metadata from FBC
+    log "INFO" "Rendering FBC: $fbc_source"
+    opm_output=$(opm render "$fbc_source") || { log "ERROR" "opm render failed for $op"; exit 1; }
+
+    log "INFO" "Finding latest bundle version..."
+    latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
+    [[ -z "$latest_bundle" ]] && { log "ERROR" "No bundle found for $op"; exit 1; }
+
+    log "INFO" "Extracting bundle data..."
+    bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
+
+    log "INFO" "Extracting operator metadata..."
+    operator_name=$(echo "$bundle_data" | jq -r '.package // empty' | head -1)
+    [[ -z "$operator_name" ]] && { log "ERROR" "Could not extract operator name for $op"; exit 1; }
+
+    operator_namespace=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' | head -1)
+    if [[ -z "$operator_namespace" ]]; then
+        operator_namespace="openshift-${operator_name}"
+        namespace_source="derived"
+    else
+        namespace_source="annotated"
+    fi
+
+    default_channel=$(echo "$opm_output" | jq -r 'select(.schema == "olm.package") | .defaultChannel // "stable"' | head -1)
+    [[ -z "$default_channel" ]] && default_channel="stable"
+
+    install_mode=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.installModes[]? | select(.supported == true) | .type' | head -1)
+    [[ -z "$install_mode" ]] && install_mode="SingleNamespace"
+
+    # Store metadata
+    OPERATOR_NAMES[$op]="$operator_name"
+    OPERATOR_BUNDLES[$op]="$latest_bundle"
+    OPERATOR_NAMESPACES[$op]="$operator_namespace"
+    OPERATOR_CHANNELS[$op]="$default_channel"
+    OPERATOR_INSTALL_MODES[$op]="$install_mode"
+
+    # Print metadata using display_metadata function
+    {
+        echo "Operator Name:    $operator_name"
+        echo "Bundle Name:      $latest_bundle"
+        echo "Namespace:        $operator_namespace ($namespace_source)"
+        echo "Channel:          $default_channel"
+        echo "Install Mode:     $install_mode"
+        echo ""
+        echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u | nl -w2 -s'. '
+    } | display_metadata
+
+    # Collect related images to temp file
+    echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' 2>/dev/null | grep -v '^$' >> "$ALL_IMAGES_FILE"
 done
+
+# Calculate total unique images
+total_images=$(sort -u "$ALL_IMAGES_FILE" | wc -l)
+
+echo ""
+echo "============================================================"
+echo "Total unique images across all operators: $total_images"
+echo "============================================================"
+
+# Mirror all related images if disconnected
+if [[ "$DISCONNECTED" == true ]]; then
+    # Merge quay and internal auth files for oc image mirror (pull+push)
+    MERGED_AUTH_FILE=$(mktemp)
+    jq -s '{auths: (.[0].auths + .[1].auths)}' "$QUAY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
+        { echo "ERROR: Failed to merge auth files for image mirroring" >&2; rm -f "$MERGED_AUTH_FILE" "$ALL_IMAGES_FILE"; exit 1; }
+
+    # Sort unique images to a new file (avoids pipefail issues with process substitution)
+    SORTED_IMAGES_FILE=$(mktemp)
+    sort -u "$ALL_IMAGES_FILE" > "$SORTED_IMAGES_FILE"
+    rm -f "$ALL_IMAGES_FILE"
+
+    echo "Mirroring related images..."
+    image_count=0
+
+    # Read directly from the sorted file
+    set +e  # Temporarily disable exit on error for the loop
+    while IFS= read -r image; do
+        [[ -z "$image" ]] && continue
+
+        digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}')
+        [[ -z "$digest" ]] && continue
+
+        ((image_count++))
+        echo "  [$image_count/$total_images] Mirroring $digest..."
+        source="${ART_IMAGES_SOURCE}@${digest}"
+        target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+
+        mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1)
+        mirror_status=$?
+        if [[ $mirror_status -eq 0 ]]; then
+            echo "    ✓ Success"
+        else
+            set -e  # Re-enable exit on error
+            echo "ERROR: Failed to mirror $digest" >&2
+            echo "Source: $source" >&2
+            echo "Target: $target" >&2
+            echo "Digest: $digest" >&2
+            echo "Error output:" >&2
+            echo "$mirror_output" >&2
+            rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
+            exit 1
+        fi
+    done < "$SORTED_IMAGES_FILE"
+    set -e  # Re-enable exit on error
+
+    echo "Successfully mirrored all $image_count images"
+    rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
+else
+    rm -f "$ALL_IMAGES_FILE"
+fi
 
 # Create IDMS
 log_step "IDMS" "Creating Image Digest Mirror Sets (IDMS)"
@@ -773,23 +772,23 @@ declare -A OPERATOR_IDMS_FILES
 
 # Loop 1: Generate all IDMS YAMLs
 for op in "${DEPLOYMENT_KEYS[@]}"; do
-        fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
-        # Sanitize the deployment key for use in IDMS name
-        sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
-        idms_name="${sanitized_key}-${IDMS_SUFFIX}"
-        
-        echo "  Generating IDMS: $idms_name"
-        
-        # Re-render FBC to get bundle data for this operator
-        opm_output=$(opm render "$fbc_source" 2>/dev/null) || { echo "ERROR: opm render failed for $op" >&2; exit 1; }
-        latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-        bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-        
-        # Create temp file for this IDMS
-        idms_file=$(mktemp)
-        OPERATOR_IDMS_FILES[$op]="$idms_file"
-        
-        {
+    fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
+    # Sanitize the deployment key for use in IDMS name
+    sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
+    idms_name="${sanitized_key}-${IDMS_SUFFIX}"
+
+    echo "  Generating IDMS: $idms_name"
+
+    # Re-render FBC to get bundle data for this operator
+    opm_output=$(opm render "$fbc_source" 2>/dev/null) || { echo "ERROR: opm render failed for $op" >&2; exit 1; }
+    latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
+    bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
+
+    # Create temp file for this IDMS
+    idms_file=$(mktemp)
+    OPERATOR_IDMS_FILES[$op]="$idms_file"
+
+    {
         echo "apiVersion: config.openshift.io/v1
 kind: ImageDigestMirrorSet
 metadata:
@@ -802,8 +801,8 @@ spec:
     - ${IDMS_MIRROR}
     source: $repo"
         done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sed 's/@sha256:[a-f0-9]\{64\}$//' | sort -u)
-        } > "$idms_file"
-    done
+    } > "$idms_file"
+done
     
 # Loop 2: Apply all IDMS YAMLs to cluster
 echo ""
@@ -855,36 +854,36 @@ declare -a SUCCESS_OPERATORS=()
 
 for op in "${DEPLOYMENT_KEYS[@]}"; do
       
-        catalog_name="${OPERATOR_CATALOG_NAMES[$op]}"
-        fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
-        operator_name="${OPERATOR_NAMES[$op]}"
-        operator_namespace="${OPERATOR_NAMESPACES[$op]}"
-        latest_bundle="${OPERATOR_BUNDLES[$op]}"
-        default_channel="${OPERATOR_CHANNELS[$op]}"
-        install_mode="${OPERATOR_INSTALL_MODES[$op]}"
-        
-        # Flag to track if this operator deployment failed
-        deployment_failed=false
-        
-        # Temporarily disable exit on error for this operator's deployment
-        set +e
+    catalog_name="${OPERATOR_CATALOG_NAMES[$op]}"
+    fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
+    operator_name="${OPERATOR_NAMES[$op]}"
+    operator_namespace="${OPERATOR_NAMESPACES[$op]}"
+    latest_bundle="${OPERATOR_BUNDLES[$op]}"
+    default_channel="${OPERATOR_CHANNELS[$op]}"
+    install_mode="${OPERATOR_INSTALL_MODES[$op]}"
 
-        if [[ "$KONFLUX_DEPLOY_CATALOG_SOURCE" == true ]]; then
-            # Deploy CatalogSource
-            if ! deploy_catalog_source "$catalog_name" "$fbc_target" "$op"; then
-                deployment_failed=true
-            fi
-        fi
+    # Flag to track if this operator deployment failed
+    deployment_failed=false
 
-        if [[ "$KONFLUX_DEPLOY_OPERATOR" == true && "$deployment_failed" == false ]]; then
-            # Deploy Operator
-            if ! deploy_operator "$op" "$operator_name" "$operator_namespace" "$latest_bundle" "$default_channel" "$install_mode" "$catalog_name"; then
-                deployment_failed=true
-            fi
+    # Temporarily disable exit on error for this operator's deployment
+    set +e
+
+    if [[ "$KONFLUX_DEPLOY_CATALOG_SOURCE" == true ]]; then
+        # Deploy CatalogSource
+        if ! deploy_catalog_source "$catalog_name" "$fbc_target" "$op"; then
+            deployment_failed=true
         fi
-        
-        # Re-enable exit on error
-        set -e
+    fi
+
+    if [[ "$KONFLUX_DEPLOY_OPERATOR" == true && "$deployment_failed" == false ]]; then
+        # Deploy Operator
+        if ! deploy_operator "$op" "$operator_name" "$operator_namespace" "$latest_bundle" "$default_channel" "$install_mode" "$catalog_name"; then
+            deployment_failed=true
+        fi
+    fi
+
+    # Re-enable exit on error
+    set -e
         
         # Record result
     if [[ "$deployment_failed" == true ]]; then
