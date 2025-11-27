@@ -40,11 +40,19 @@ jobs:
 
       - name: Install OpenShift CLI (oc) and opm
         run: |
-          # Get the OpenShift version from CRC release info
-          CRC_INFO=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json)
-          OCP_FULL_VERSION=$(echo "$CRC_INFO" | jq -r '.version.openshiftVersion')
-          OCP_MINOR_VERSION=$(echo "$OCP_FULL_VERSION" | cut -d. -f1-2)
-          echo "CRC will deploy OpenShift ${OCP_FULL_VERSION}, installing matching oc and opm..."
+          # Try to get the OpenShift version from CRC release info
+          echo "Fetching CRC release information..."
+          CRC_INFO=$(curl -s --max-time 10 https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json || echo "")
+          
+          if [ -n "$CRC_INFO" ] && echo "$CRC_INFO" | jq -e '.version.openshiftVersion' >/dev/null 2>&1; then
+            OCP_FULL_VERSION=$(echo "$CRC_INFO" | jq -r '.version.openshiftVersion')
+            OCP_MINOR_VERSION=$(echo "$OCP_FULL_VERSION" | cut -d. -f1-2)
+            echo "CRC will deploy OpenShift ${OCP_FULL_VERSION}, installing matching oc and opm..."
+          else
+            echo "Could not determine OpenShift version from CRC info, using latest stable versions"
+            OCP_FULL_VERSION="latest"
+            OCP_MINOR_VERSION="latest"
+          fi
           
           # Function to download and extract with validation
           download_and_extract() {
@@ -94,10 +102,21 @@ jobs:
           # Install oc CLI - try multiple URL formats
           echo "Installing oc CLI..."
           OCP_OC_INSTALLED=false
-          for url in \
-            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-${OCP_MINOR_VERSION}/openshift-client-linux.tar.gz" \
-            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_FULL_VERSION}/openshift-client-linux.tar.gz" \
-            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz"; do
+          
+          # Build URL list - always try latest first, then version-specific if available
+          if [ "$OCP_FULL_VERSION" != "latest" ] && [ -n "$OCP_MINOR_VERSION" ] && [ "$OCP_MINOR_VERSION" != "latest" ]; then
+            URL_LIST=(
+              "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz"
+              "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-${OCP_MINOR_VERSION}/openshift-client-linux.tar.gz"
+              "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_FULL_VERSION}/openshift-client-linux.tar.gz"
+            )
+          else
+            URL_LIST=(
+              "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz"
+            )
+          fi
+          
+          for url in "${URL_LIST[@]}"; do
             if download_and_extract "$url" "/usr/local/bin"; then
               OCP_OC_INSTALLED=true
               break
@@ -113,10 +132,21 @@ jobs:
           # Install opm - try multiple URL formats
           echo "Installing opm..."
           OPM_INSTALLED=false
-          for url in \
-            "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-${OCP_MINOR_VERSION}/opm-linux.tar.gz" \
-            "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OCP_FULL_VERSION}/opm-linux.tar.gz" \
-            "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest/opm-linux.tar.gz"; do
+          
+          # Build URL list - always try latest first, then version-specific if available
+          if [ "$OCP_FULL_VERSION" != "latest" ] && [ -n "$OCP_MINOR_VERSION" ] && [ "$OCP_MINOR_VERSION" != "latest" ]; then
+            OPM_URL_LIST=(
+              "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest/opm-linux.tar.gz"
+              "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-${OCP_MINOR_VERSION}/opm-linux.tar.gz"
+              "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OCP_FULL_VERSION}/opm-linux.tar.gz"
+            )
+          else
+            OPM_URL_LIST=(
+              "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest/opm-linux.tar.gz"
+            )
+          fi
+          
+          for url in "${OPM_URL_LIST[@]}"; do
             if download_and_extract "$url" "/usr/local/bin"; then
               OPM_INSTALLED=true
               break
