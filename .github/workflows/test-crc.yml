@@ -299,6 +299,20 @@ jobs:
             echo "Please add your pull secret to GitHub secrets."
           fi
           
+          # Clean up disk space before starting CRC (GitHub Actions runners have limited disk space)
+          echo "Cleaning up disk space before starting CRC..."
+          df -h
+          # Remove unnecessary packages and caches
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          # Clean up any temporary files
+          sudo rm -rf /tmp/* /var/tmp/* || true
+          # Clean up Docker/Podman images if any
+          podman system prune -af --volumes 2>/dev/null || true
+          # Show available disk space
+          echo "Available disk space after cleanup:"
+          df -h
+          
           # Ensure crc-admin-helper has correct permissions (SUID bit and root ownership required)
           # Double-check permissions before starting CRC
           if [ -f ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
@@ -331,16 +345,20 @@ jobs:
           fi
           
           # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
+          # Note: sg libvirt requires the user to be in the libvirt group (already done in Install dependencies step)
           CRC_START_SUCCESS=false
           if [ -n "$CRC_PULL_SECRET" ]; then
             echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
               echo "Warning: sg failed, trying runuser..."
               echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' && CRC_START_SUCCESS=true || {
-                echo "Warning: runuser failed, trying direct crc start..."
-                echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt && CRC_START_SUCCESS=true || {
+                echo "Warning: runuser failed, trying direct crc start with sg..."
+                # Last resort: try direct with sg (may fail on group check but worth trying)
+                echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
                   echo "ERROR: All attempts to start CRC failed!"
                   echo "Checking CRC status..."
                   crc status || true
+                  echo "Checking disk space..."
+                  df -h
                   exit 1
                 }
               }
@@ -350,11 +368,14 @@ jobs:
             sg libvirt -c "crc start" && CRC_START_SUCCESS=true || {
               echo "Warning: sg failed, trying runuser..."
               sudo runuser -u $USER -g libvirt -- crc start && CRC_START_SUCCESS=true || {
-                echo "Warning: runuser failed, trying direct crc start..."
-                crc start && CRC_START_SUCCESS=true || {
+                echo "Warning: runuser failed, trying direct crc start with sg..."
+                # Last resort: try direct with sg (may fail on group check but worth trying)
+                sg libvirt -c "crc start" && CRC_START_SUCCESS=true || {
                   echo "ERROR: All attempts to start CRC failed!"
                   echo "Checking CRC status..."
                   crc status || true
+                  echo "Checking disk space..."
+                  df -h
                   exit 1
                 }
               }
