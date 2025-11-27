@@ -468,7 +468,7 @@ else
         # Use FBC tag as the deployment key
         DEPLOYMENT_KEYS+=("$fbc_tag")
         # Create a sanitized catalog name from the FBC tag
-        catalog_name=$(echo "$fbc_tag" | tr ':' '-' | tr '/' '-')
+        catalog_name=$(echo "$fbc_tag" | tr ':' '-' | tr '/' '-' | tr '_' '-')
         OPERATOR_CATALOG_NAMES[$fbc_tag]="${catalog_name}-konflux"
         OPERATOR_FBC_SOURCES[$fbc_tag]="${ART_FBC_BASE}:${fbc_tag}"
         OPERATOR_FBC_TARGETS[$fbc_tag]="${OPERATOR_FBC_SOURCES[$fbc_tag]}"
