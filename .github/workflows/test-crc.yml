@@ -275,12 +275,13 @@ jobs:
             }
           }
           
-          # Ensure crc-admin-helper has correct permissions (SUID bit is required)
+          # Ensure crc-admin-helper has correct permissions (SUID bit and root ownership required)
           # This must be done after crc setup creates the file
           if [ -f ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
-            echo "Setting SUID bit on crc-admin-helper..."
+            echo "Setting SUID bit and root ownership on crc-admin-helper..."
+            # CRC requires crc-admin-helper to be owned by root with SUID bit set
+            sudo chown root:root ~/.crc/bin/crc-admin-helper-linux-amd64 || true
             sudo chmod u+s ~/.crc/bin/crc-admin-helper-linux-amd64 || sudo chmod 4755 ~/.crc/bin/crc-admin-helper-linux-amd64 || true
-            sudo chown $USER:$USER ~/.crc/bin/crc-admin-helper-linux-amd64 || true
             # Verify the permissions were set correctly
             ls -l ~/.crc/bin/crc-admin-helper-linux-amd64 || true
           else
@@ -298,21 +299,29 @@ jobs:
             echo "Please add your pull secret to GitHub secrets."
           fi
           
-          # Ensure crc-admin-helper has correct permissions (SUID bit is required)
+          # Ensure crc-admin-helper has correct permissions (SUID bit and root ownership required)
           # Double-check permissions before starting CRC
           if [ -f ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
             echo "Verifying crc-admin-helper permissions before starting CRC..."
-            # Set SUID bit using both methods for maximum compatibility
+            # CRC requires crc-admin-helper to be owned by root with SUID bit set
+            sudo chown root:root ~/.crc/bin/crc-admin-helper-linux-amd64 || true
             sudo chmod u+s ~/.crc/bin/crc-admin-helper-linux-amd64 2>/dev/null || true
             sudo chmod 4755 ~/.crc/bin/crc-admin-helper-linux-amd64 || true
-            sudo chown $USER:$USER ~/.crc/bin/crc-admin-helper-linux-amd64 || true
             # Verify the permissions
             ls -l ~/.crc/bin/crc-admin-helper-linux-amd64 || true
-            # Check if SUID bit is set
+            # Check if SUID bit is set and owned by root
             if [ -u ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
-              echo "SUID bit is correctly set on crc-admin-helper"
+              OWNER=$(stat -c '%U' ~/.crc/bin/crc-admin-helper-linux-amd64 2>/dev/null || echo "unknown")
+              if [ "$OWNER" = "root" ]; then
+                echo "SUID bit and root ownership are correctly set on crc-admin-helper"
+              else
+                echo "WARNING: crc-admin-helper is not owned by root (owner: $OWNER), fixing..."
+                sudo chown root:root ~/.crc/bin/crc-admin-helper-linux-amd64
+                ls -l ~/.crc/bin/crc-admin-helper-linux-amd64 || true
+              fi
             else
               echo "WARNING: SUID bit is NOT set on crc-admin-helper, trying to fix..."
+              sudo chown root:root ~/.crc/bin/crc-admin-helper-linux-amd64
               sudo chmod u+s ~/.crc/bin/crc-admin-helper-linux-amd64
               ls -l ~/.crc/bin/crc-admin-helper-linux-amd64 || true
             fi
