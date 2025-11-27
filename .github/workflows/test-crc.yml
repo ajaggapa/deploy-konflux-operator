@@ -42,21 +42,91 @@ jobs:
         run: |
           # Get the OpenShift version from CRC release info
           CRC_INFO=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json)
-          OCP_VERSION=$(echo "$CRC_INFO" | jq -r '.version.openshiftVersion' | cut -d. -f1-2)
-          echo "CRC will deploy OpenShift ${OCP_VERSION}, installing matching oc and opm..."
+          OCP_FULL_VERSION=$(echo "$CRC_INFO" | jq -r '.version.openshiftVersion')
+          OCP_MINOR_VERSION=$(echo "$OCP_FULL_VERSION" | cut -d. -f1-2)
+          echo "CRC will deploy OpenShift ${OCP_FULL_VERSION}, installing matching oc and opm..."
           
-          # Install oc CLI (use latest patch version for the minor version)
-          curl -sL "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-${OCP_VERSION}/openshift-client-linux.tar.gz" | \
-            sudo tar -xzf - -C /usr/local/bin/ || \
-            curl -sL "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_VERSION}/openshift-client-linux.tar.gz" | \
-            sudo tar -xzf - -C /usr/local/bin/
+          # Function to download and extract with validation
+          download_and_extract() {
+            local url=$1
+            local dest_dir=$2
+            local temp_file=$(mktemp)
+            
+            echo "Downloading from: $url"
+            if ! curl -f -sL "$url" -o "$temp_file"; then
+              echo "Failed to download (curl error)"
+              rm -f "$temp_file"
+              return 1
+            fi
+            
+            # Check file size (should be > 0)
+            if [ ! -s "$temp_file" ]; then
+              echo "Downloaded file is empty"
+              rm -f "$temp_file"
+              return 1
+            fi
+            
+            # Check if file is HTML (404 page)
+            if head -1 "$temp_file" 2>/dev/null | grep -qE "<!DOCTYPE|<html"; then
+              echo "Downloaded file appears to be HTML (likely 404)"
+              rm -f "$temp_file"
+              return 1
+            fi
+            
+            # Check if it's a valid gzip file
+            if ! gzip -t "$temp_file" 2>/dev/null; then
+              echo "File is not a valid gzip archive"
+              rm -f "$temp_file"
+              return 1
+            fi
+            
+            # Extract directly to destination
+            if sudo tar -xzf "$temp_file" -C "$dest_dir" 2>/dev/null; then
+              rm -f "$temp_file"
+              return 0
+            else
+              echo "Failed to extract archive"
+              rm -f "$temp_file"
+              return 1
+            fi
+          }
+          
+          # Install oc CLI - try multiple URL formats
+          echo "Installing oc CLI..."
+          OCP_OC_INSTALLED=false
+          for url in \
+            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-${OCP_MINOR_VERSION}/openshift-client-linux.tar.gz" \
+            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_FULL_VERSION}/openshift-client-linux.tar.gz" \
+            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz"; do
+            if download_and_extract "$url" "/usr/local/bin"; then
+              OCP_OC_INSTALLED=true
+              break
+            fi
+          done
+          
+          if [ "$OCP_OC_INSTALLED" = false ]; then
+            echo "ERROR: Failed to install oc CLI from any URL"
+            exit 1
+          fi
           oc version --client
           
-          # Install opm
-          curl -sL "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-${OCP_VERSION}/opm-linux.tar.gz" | \
-            sudo tar -xzf - -C /usr/local/bin/ || \
-            curl -sL "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OCP_VERSION}/opm-linux.tar.gz" | \
-            sudo tar -xzf - -C /usr/local/bin/
+          # Install opm - try multiple URL formats
+          echo "Installing opm..."
+          OPM_INSTALLED=false
+          for url in \
+            "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-${OCP_MINOR_VERSION}/opm-linux.tar.gz" \
+            "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OCP_FULL_VERSION}/opm-linux.tar.gz" \
+            "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest/opm-linux.tar.gz"; do
+            if download_and_extract "$url" "/usr/local/bin"; then
+              OPM_INSTALLED=true
+              break
+            fi
+          done
+          
+          if [ "$OPM_INSTALLED" = false ]; then
+            echo "ERROR: Failed to install opm from any URL"
+            exit 1
+          fi
           opm version
 
       - name: Install CRC
