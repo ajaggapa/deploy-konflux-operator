@@ -257,7 +257,13 @@ jobs:
           crc config set disk-size 50  # Reduce disk size
           
           # Setup CRC (download and extract bundle)
-          crc setup
+          # Use 'sg libvirt' to run in libvirt group context without requiring logout
+          # This is needed because group membership changes require re-login
+          sg libvirt -c "crc setup" || {
+            echo "Warning: crc setup with sg libvirt failed, trying with sudo..."
+            # Fallback: try with sudo if sg doesn't work
+            sudo -u $USER -g libvirt crc setup || crc setup
+          }
 
       - name: Start CRC cluster
         env:
