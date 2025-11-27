@@ -2,6 +2,14 @@
 
 set -Eeuo pipefail
 
+# See --operator flag for valid operators
+VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage"
+
+KONFLUX_SKIP_DEPLOYMENT="${KONFLUX_SKIP_DEPLOYMENT:-false}"
+# Env variables to control the deployment of CatalogSource and Operator
+KONFLUX_DEPLOY_CATALOG_SOURCE="${KONFLUX_DEPLOY_CATALOG_SOURCE:-true}"
+KONFLUX_DEPLOY_OPERATOR="${KONFLUX_DEPLOY_OPERATOR:-true}"
+
 # Color codes for logging
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -68,6 +76,11 @@ display_metadata() {
     echo "============================================================"
 }
 
+if [[ "$KONFLUX_SKIP_DEPLOYMENT" == true ]]; then
+    log "INFO" "Skipping deployment due to KONFLUX_SKIP_DEPLOYMENT flag"
+    exit 0
+fi
+
 # Parse arguments
 log_step "INIT" "Starting Konflux Operator Deployment"
 log "INFO" "Using MCP timeout: ${MCP_TIMEOUT:-600s}"
@@ -79,7 +92,8 @@ MCP_TIMEOUT="${MCP_TIMEOUT:-600s}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --operator) 
+        --operator)
+            # This argument is checked against the VALID_OPERATORS list
             OPERATOR="$2"
             log "INFO" "Operator specified: $2"
             shift 2 
@@ -118,6 +132,8 @@ done
 
 log "INFO" "Validating operator configuration"
 
+
+
 if [[ -n "${OPERATOR:-}" && -n "${FBC_TAG_INPUT:-}" ]]; then
     log "ERROR" "Provide either --operator or --fbc-tag, not both"
     exit 1
@@ -134,7 +150,6 @@ if [[ -n "${OPERATOR:-}" ]]; then
     log "INFO" "Parsing operators: ${OPERATORS[*]}"
     
     # Validate all operators are in predefined list
-    VALID_OPERATORS="sriov metallb nmstate ptp pfstatus"
     for op in "${OPERATORS[@]}"; do
         if [[ ! " $VALID_OPERATORS " =~ " $op " ]]; then
             log "ERROR" "Invalid operator: $op"
@@ -228,15 +243,197 @@ get_fbc_tag() {
         nmstate) echo "ocp__${ver}__kubernetes-nmstate-rhel9-operator" ;;
         ptp) echo "ocp__${ver}__ose-ptp-rhel9-operator" ;;
         pfstatus) echo "ocp__${ver}__pf-status-relay-rhel9-operator" ;;
+        local-storage) echo "ocp__${ver}__ose-local-storage-rhel9-operator" ;;
         *) echo "" ;;
     esac
+}
+
+# Helper function to deploy CatalogSource
+deploy_catalog_source() {
+    local catalog_name=$1
+    local fbc_target=$2
+    local op=$3
+
+    echo "------------------------------------------------------------"
+    echo "Deploying CatalogSource for $op..."
+    echo "------------------------------------------------------------"
+
+    log "INFO" "Cleaning up existing CatalogSource for $op..."
+    log "INFO" "  - Deleting CatalogSource: $catalog_name"
+    oc delete catalogsource "$catalog_name" -n openshift-marketplace --ignore-not-found &>/dev/null || true
+    log "SUCCESS" "CatalogSource cleaned up"
+
+    # Create CatalogSource
+    log "INFO" "Creating CatalogSource for $op..."
+    if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ${catalog_name}
+  namespace: openshift-marketplace
+spec:
+  displayName: ${catalog_name}
+  image: ${fbc_target}
+  sourceType: grpc
+EOF
+    then
+        log "ERROR" "CatalogSource apply failed for $op"
+        return 1
+    else
+        log "SUCCESS" "CatalogSource created"
+    fi
+
+    # Wait for catalog ready
+    log "INFO" "Waiting for CatalogSource to be ready..."
+    if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
+        catalogsource "$catalog_name" -n openshift-marketplace --timeout=300s 2>/dev/null; then
+        log "ERROR" "CatalogSource $catalog_name not ready within timeout"
+        return 1
+    else
+        log "SUCCESS" "CatalogSource is ready"
+    fi
+
+    return 0
+}
+
+# Helper function to deploy operator
+deploy_operator() {
+    local op=$1
+    local operator_name=$2
+    local operator_namespace=$3
+    local latest_bundle=$4
+    local default_channel=$5
+    local install_mode=$6
+    local catalog_name=$7
+
+    echo "------------------------------------------------------------"
+    echo "Deploying Operator for $op..."
+    echo "------------------------------------------------------------"
+
+    log "INFO" "Cleaning up existing namespace for $op..."
+    log "INFO" "  - Deleting namespace: $operator_namespace"
+    oc delete namespace "$operator_namespace" --ignore-not-found &>/dev/null || true
+    log "SUCCESS" "Namespace cleaned up"
+
+    # Create namespace
+    log "INFO" "Creating Namespace for $op..."
+    if ! oc apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $operator_namespace
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+EOF
+    then
+        log "ERROR" "Namespace creation failed for $op"
+        return 1
+    fi
+    log "SUCCESS" "Namespace created"
+
+    # Create OperatorGroup
+    log "INFO" "Creating OperatorGroup for $op..."
+    if [[ "$install_mode" == "AllNamespaces" ]]; then
+        if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: operator-group-${operator_name}
+  namespace: ${operator_namespace}
+spec: {}
+EOF
+        then
+            log "ERROR" "OperatorGroup apply failed for $op"
+            return 1
+        fi
+    else
+        if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: operator-group-${operator_name}
+  namespace: ${operator_namespace}
+spec:
+  targetNamespaces:
+  - ${operator_namespace}
+EOF
+        then
+            log "ERROR" "OperatorGroup apply failed for $op"
+            return 1
+        fi
+    fi
+    log "SUCCESS" "OperatorGroup created"
+
+    # Create Subscription
+    log "INFO" "Creating Subscription for $op..."
+    if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ${operator_name}
+  namespace: ${operator_namespace}
+spec:
+  channel: $default_channel
+  installPlanApproval: Automatic
+  name: ${operator_name}
+  source: $catalog_name
+  sourceNamespace: openshift-marketplace
+EOF
+    then
+        log "ERROR" "Subscription apply failed for $op"
+        return 1
+    fi
+    log "SUCCESS" "Subscription created"
+
+    # Wait for subscription to get currentCSV
+    log "INFO" "Waiting for subscription to resolve..."
+    if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${operator_name}" -n "${operator_namespace}" --timeout=120s 2>/dev/null; then
+        log "ERROR" "Subscription did not resolve within timeout"
+        return 1
+    fi
+    log "SUCCESS" "Subscription resolved"
+
+    # Wait for CSV
+    log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
+    csv_timeout=180
+    csv_elapsed=0
+    csv_created=false
+    while [[ $csv_elapsed -lt $csv_timeout ]]; do
+        if oc get csv "$latest_bundle" -n "$operator_namespace" >/dev/null 2>&1; then
+            csv_created=true
+            break
+        fi
+        sleep 2
+        csv_elapsed=$((csv_elapsed + 2))
+    done
+    if [[ "$csv_created" == false ]]; then
+        log "ERROR" "CSV ${latest_bundle} not created within timeout"
+        return 1
+    fi
+    log "SUCCESS" "CSV created"
+
+    log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
+    if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$operator_namespace" --timeout=120s 2>/dev/null; then
+        log "ERROR" "CSV ${latest_bundle} did not reach Succeeded phase"
+        return 1
+    fi
+    log "SUCCESS" "CSV reached Succeeded phase"
+
+    # Wait for operator pods
+    log "INFO" "Waiting for operator pods to be ready..."
+    if ! oc wait --for=condition=Ready pods --all -n "$operator_namespace" --timeout=120s 2>/dev/null; then
+        log "ERROR" "Operator pods not ready within timeout"
+        return 1
+    fi
+    log "SUCCESS" "All operator pods are ready"
+
+    return 0
 }
 
 # Set operator config
 ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
 
 # Arrays to store operator metadata
-declare -A OPERATOR_FBC_TAGS
 declare -A OPERATOR_CATALOG_NAMES
 declare -A OPERATOR_FBC_SOURCES
 declare -A OPERATOR_FBC_TARGETS
@@ -250,7 +447,6 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
     # Multiple operators mode
     for op in "${OPERATORS[@]}"; do
         fbc_tag=$(get_fbc_tag "$op" "$VERSION")
-        OPERATOR_FBC_TAGS[$op]="$fbc_tag"
         OPERATOR_CATALOG_NAMES[$op]="${op}-konflux"
         OPERATOR_FBC_SOURCES[$op]="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
         if [[ "$DISCONNECTED" == true ]]; then
@@ -767,10 +963,7 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
     declare -a SUCCESS_OPERATORS=()
     
     for op in "${OPERATORS[@]}"; do
-        echo ""
-        echo "Deploying operator: $op"
-        echo "------------------------------------------------------------"
-        
+      
         catalog_name="${OPERATOR_CATALOG_NAMES[$op]}"
         fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
         operator_name="${OPERATOR_NAMES[$op]}"
@@ -782,181 +975,20 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
         # Flag to track if this operator deployment failed
         deployment_failed=false
         
-        # Cleanup existing resources
-        log "INFO" "Cleaning up existing resources for $op..."
-        log "INFO" "  - Deleting namespace: $operator_namespace"
-        oc delete namespace "$operator_namespace" --ignore-not-found >/dev/null 2>&1 || true
-        log "INFO" "  - Deleting CatalogSource: $catalog_name"
-        oc delete catalogsource "$catalog_name" -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
-        log "SUCCESS" "Cleanup completed for $op"
-        
         # Temporarily disable exit on error for this operator's deployment
         set +e
-        
-        # Create CatalogSource
-        log "INFO" "Creating CatalogSource for $op..."
-        if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: CatalogSource
-metadata:
-  name: ${catalog_name}
-  namespace: openshift-marketplace
-spec:
-  displayName: ${catalog_name}
-  image: ${fbc_target}
-  sourceType: grpc
-EOF
-        then
-            log "ERROR" "CatalogSource apply failed for $op"
-            deployment_failed=true
-        else
-            log "SUCCESS" "CatalogSource created"
-        fi
-        
-        # Wait for catalog ready
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for CatalogSource to be ready..."
-            if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
-                catalogsource "$catalog_name" -n openshift-marketplace --timeout=300s 2>/dev/null; then
-                log "ERROR" "CatalogSource $catalog_name not ready within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "CatalogSource is ready"
-            fi
-        fi
-        
-        # Create namespace
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Creating Namespace for $op..."
-            if oc apply -f - >/dev/null 2>&1 <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $operator_namespace
-  labels:
-    pod-security.kubernetes.io/enforce: privileged
-EOF
-            then
-                log "SUCCESS" "Namespace created"
-            else
-                log "ERROR" "Namespace creation failed for $op"
+
+        if [[ "$KONFLUX_DEPLOY_CATALOG_SOURCE" == true ]]; then
+            # Deploy CatalogSource
+            if ! deploy_catalog_source "$catalog_name" "$fbc_target" "$op"; then
                 deployment_failed=true
             fi
         fi
-        
-        # Create OperatorGroup
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Creating OperatorGroup for $op..."
-            if [[ "$install_mode" == "AllNamespaces" ]]; then
-                if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${operator_name}
-  namespace: ${operator_namespace}
-spec: {}
-EOF
-                then
-                    log "ERROR" "OperatorGroup apply failed for $op"
-                    deployment_failed=true
-                else
-                    log "SUCCESS" "OperatorGroup created"
-                fi
-            else
-                if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${operator_name}
-  namespace: ${operator_namespace}
-spec:
-  targetNamespaces:
-  - ${operator_namespace}
-EOF
-                then
-                    log "ERROR" "OperatorGroup apply failed for $op"
-                    deployment_failed=true
-                else
-                    log "SUCCESS" "OperatorGroup created"
-                fi
-            fi
-        fi
-        
-        # Create Subscription
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Creating Subscription for $op..."
-            if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: ${operator_name}
-  namespace: ${operator_namespace}
-spec:
-  channel: $default_channel
-  installPlanApproval: Automatic
-  name: ${operator_name}
-  source: $catalog_name
-  sourceNamespace: openshift-marketplace
-EOF
-            then
-                log "ERROR" "Subscription apply failed for $op"
+
+        if [[ "$KONFLUX_DEPLOY_OPERATOR" == true && "$deployment_failed" == false ]]; then
+            # Deploy Operator
+            if ! deploy_operator "$op" "$operator_name" "$operator_namespace" "$latest_bundle" "$default_channel" "$install_mode" "$catalog_name"; then
                 deployment_failed=true
-            else
-                log "SUCCESS" "Subscription created"
-            fi
-        fi
-        
-        # Wait for subscription to get currentCSV
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for subscription to resolve..."
-            if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${operator_name}" -n "${operator_namespace}" --timeout=120s 2>/dev/null; then
-                log "ERROR" "Subscription did not resolve within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "Subscription resolved"
-            fi
-        fi
-        
-        # Wait for CSV
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-            csv_timeout=180
-            csv_elapsed=0
-            csv_created=false
-            while [[ $csv_elapsed -lt $csv_timeout ]]; do
-                if oc get csv "$latest_bundle" -n "$operator_namespace" >/dev/null 2>&1; then
-                    csv_created=true
-                    break
-                fi
-                sleep 2
-                csv_elapsed=$((csv_elapsed + 2))
-            done
-            if [[ "$csv_created" == false ]]; then
-                log "ERROR" "CSV ${latest_bundle} not created within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "CSV created"
-            fi
-        fi
-        
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
-            if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$operator_namespace" --timeout=120s 2>/dev/null; then
-                log "ERROR" "CSV ${latest_bundle} did not reach Succeeded phase"
-                deployment_failed=true
-            else
-                log "SUCCESS" "CSV reached Succeeded phase"
-            fi
-        fi
-        
-        # Wait for operator pods
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for operator pods to be ready..."
-            if ! oc wait --for=condition=Ready pods --all -n "$operator_namespace" --timeout=120s 2>/dev/null; then
-                log "ERROR" "Operator pods not ready within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "All operator pods are ready"
             fi
         fi
         
@@ -989,128 +1021,14 @@ EOF
     
 else
     # Deploy single operator (original behavior)
-    log "INFO" "Deploying single operator"
-    
-    # Cleanup existing resources
-    log "INFO" "Cleaning up existing resources..."
-    log "INFO" "  - Deleting namespace: $OPERATOR_NAMESPACE"
-    oc delete namespace "$OPERATOR_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
-    log "INFO" "  - Deleting CatalogSource: $CATALOG_NAME"
-    oc delete catalogsource "$CATALOG_NAME" -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
-    log "SUCCESS" "Cleanup completed"
-    
-    # Create CatalogSource
-    log "INFO" "Creating CatalogSource..."
-    oc apply -f - <<EOF || { log "ERROR" "CatalogSource apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1alpha1
-kind: CatalogSource
-metadata:
-  name: ${CATALOG_NAME}
-  namespace: openshift-marketplace
-spec:
-  displayName: ${CATALOG_NAME}
-  image: ${fbc_target}
-  sourceType: grpc
-EOF
-    log "SUCCESS" "CatalogSource created"
-    
-    # Wait for catalog ready
-    log "INFO" "Waiting for CatalogSource to be ready..."
-    oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
-        catalogsource "$CATALOG_NAME" -n openshift-marketplace --timeout=300s 2>/dev/null || true
-    log "SUCCESS" "CatalogSource is ready"
-    
-    # Create namespace
-    log "INFO" "Creating Namespace..."
-    oc apply -f - >/dev/null 2>&1 <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $OPERATOR_NAMESPACE
-  labels:
-    pod-security.kubernetes.io/enforce: privileged
-EOF
-    log "SUCCESS" "Namespace created"
-    
-    # Create OperatorGroup
-    log "INFO" "Creating OperatorGroup..."
-    if [[ "$install_mode" == "AllNamespaces" ]]; then
-        oc apply -f - <<EOF || { log "ERROR" "OperatorGroup apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${OPERATOR_NAME}
-  namespace: ${OPERATOR_NAMESPACE}
-spec: {}
-EOF
-    log "SUCCESS" "OperatorGroup created"
-    else
-        oc apply -f - <<EOF || { log "ERROR" "OperatorGroup apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${OPERATOR_NAME}
-  namespace: ${OPERATOR_NAMESPACE}
-spec:
-  targetNamespaces:
-  - ${OPERATOR_NAMESPACE}
-EOF
-    log "SUCCESS" "OperatorGroup created"
+    if [[ "$DEPLOY_CATALOG_SOURCE" == true ]]; then
+        # Deploy CatalogSource
+        deploy_catalog_source "$CATALOG_NAME" "$fbc_target" "single-operator" || { log "ERROR" "Failed to deploy CatalogSource"; exit 1; }
     fi
-    
-    # Create Subscription
-    log "INFO" "Creating Subscription..."
-    oc apply -f - <<EOF || { log "ERROR" "Subscription apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: ${OPERATOR_NAME}
-  namespace: ${OPERATOR_NAMESPACE}
-spec:
-  channel: $default_channel
-  installPlanApproval: Automatic
-  name: ${OPERATOR_NAME}
-  source: $CATALOG_NAME
-  sourceNamespace: openshift-marketplace
-EOF
-    log "SUCCESS" "Subscription created"
-    
-    # Wait for subscription to get currentCSV
-    log "INFO" "Waiting for subscription to resolve..."
-    if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${OPERATOR_NAME}" -n "${OPERATOR_NAMESPACE}" --timeout=120s 2>/dev/null; then
-        log "ERROR" "Subscription did not resolve within timeout"
-        exit 1
+
+    if [[ "$DEPLOY_OPERATOR" == true ]]; then
+        # Deploy Operator
+        deploy_operator "single-operator" "$OPERATOR_NAME" "$OPERATOR_NAMESPACE" "$latest_bundle" "$default_channel" "$install_mode" "$CATALOG_NAME" || { log "ERROR" "Failed to deploy operator"; exit 1; }
     fi
-    log "SUCCESS" "Subscription resolved"
-    
-    # Wait for CSV
-    log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-    csv_timeout=180
-    csv_elapsed=0
-    csv_created=false
-    while [[ $csv_elapsed -lt $csv_timeout ]]; do
-        if oc get csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" >/dev/null 2>&1; then
-            csv_created=true
-            break
-        fi
-        sleep 2
-        csv_elapsed=$((csv_elapsed + 2))
-    done
-    if [[ "$csv_created" == false ]]; then
-        log "WARNING" "CSV ${latest_bundle} was not created within timeout"
-    else
-        log "SUCCESS" "CSV created"
-    fi
-    
-    log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
-    oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
-        { log "WARNING" "CSV ${latest_bundle} did not reach Succeeded phase within timeout"; }
-    log "SUCCESS" "CSV reached Succeeded phase"
-    
-    # Wait for operator pods
-    log "INFO" "Waiting for operator pods to be ready..."
-    oc wait --for=condition=Ready pods --all -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
-        { log "WARNING" "Operator pods did not reach Ready state within timeout"; }
-    log "SUCCESS" "All operator pods are ready"
 fi
 
