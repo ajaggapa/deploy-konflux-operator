@@ -159,6 +159,9 @@ if [[ -n "${OPERATOR:-}" ]]; then
     done
     log "SUCCESS" "Operators to deploy: ${OPERATORS[*]}"
 else
+    # FBC tag mode: parse comma-separated FBC tags and use them directly
+    IFS=',' read -ra FBC_TAGS <<< "$FBC_TAG_INPUT"
+    log "INFO" "Parsed FBC tags: ${FBC_TAGS[*]}"
     OPERATORS=()
     log "INFO" "No operators specified, will use FBC tag mode"
 fi
@@ -432,6 +435,7 @@ EOF
 
 # Set operator config
 ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
+ART_FBC_BASE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc"
 
 # Arrays to store operator metadata
 declare -A OPERATOR_CATALOG_NAMES
@@ -443,23 +447,35 @@ declare -A OPERATOR_NAMESPACES
 declare -A OPERATOR_CHANNELS
 declare -A OPERATOR_INSTALL_MODES
 
+# Unified deployment configuration
+# OPERATORS array will contain either operator names or FBC tags
+declare -a DEPLOYMENT_KEYS=()
+
 if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    # Multiple operators mode
+    # Operator mode: derive FBC tags from operator names
     for op in "${OPERATORS[@]}"; do
         fbc_tag=$(get_fbc_tag "$op" "$VERSION")
+        DEPLOYMENT_KEYS+=("$op")
         OPERATOR_CATALOG_NAMES[$op]="${op}-konflux"
-        OPERATOR_FBC_SOURCES[$op]="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+        OPERATOR_FBC_SOURCES[$op]="${ART_FBC_BASE}:${fbc_tag}"
+        OPERATOR_FBC_TARGETS[$op]="${OPERATOR_FBC_SOURCES[$op]}"
         if [[ "$DISCONNECTED" == true ]]; then
             OPERATOR_FBC_TARGETS[$op]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
-        else
-            OPERATOR_FBC_TARGETS[$op]="${OPERATOR_FBC_SOURCES[$op]}"
         fi
     done
 else
-    # Single FBC tag mode
-    FBC_TAG="${FBC_TAG_INPUT}"
-    CATALOG_NAME=$(echo "$FBC_TAG" | sed 's/ocp__[^_]*__//' | sed 's/-rhel9-operator$//' | sed 's/-operator$//')-konflux
-    FBC_SOURCE_IMAGE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
+    for fbc_tag in "${FBC_TAGS[@]}"; do
+        # Use FBC tag as the deployment key
+        DEPLOYMENT_KEYS+=("$fbc_tag")
+        # Create a sanitized catalog name from the FBC tag
+        catalog_name=$(echo "$fbc_tag" | tr ':' '-' | tr '/' '-')
+        OPERATOR_CATALOG_NAMES[$fbc_tag]="${catalog_name}-konflux"
+        OPERATOR_FBC_SOURCES[$fbc_tag]="${ART_FBC_BASE}:${fbc_tag}"
+        OPERATOR_FBC_TARGETS[$fbc_tag]="${OPERATOR_FBC_SOURCES[$fbc_tag]}"
+        if [[ "$DISCONNECTED" == true ]]; then
+            OPERATOR_FBC_TARGETS[$fbc_tag]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+        fi
+    done
 fi
 
 # Authenticate registries
@@ -600,13 +616,12 @@ fi
 # Mirror FBC images and extract metadata
 log_step "METADATA" "Extracting operator metadata from FBC"
 
-if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    log "INFO" "Processing ${#OPERATORS[@]} operator(s)"
-    
-    # Temporary file to collect all related images across all operators
-    ALL_IMAGES_FILE=$(mktemp)
-    
-    for op in "${OPERATORS[@]}"; do
+log "INFO" "Processing ${#DEPLOYMENT_KEYS[@]} operator(s)/FBC tag(s)"
+
+# Temporary file to collect all related images across all operators
+ALL_IMAGES_FILE=$(mktemp)
+
+for op in "${DEPLOYMENT_KEYS[@]}"; do
         log "INFO" "Processing operator: $op"
         
         fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
@@ -737,123 +752,31 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
     else
         rm -f "$ALL_IMAGES_FILE"
     fi
-    
-else
-    # Single FBC tag mode (original behavior)
-    log "INFO" "Processing single operator from FBC tag"
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        log "INFO" "Mirroring FBC image for disconnected cluster..."
-        fbc_target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
-        mirror_output=$(oc image mirror --keep-manifest-list=true "$FBC_SOURCE_IMAGE" "$fbc_target" 2>&1)
-        mirror_status=$?
-        if [[ $mirror_status -ne 0 ]]; then
-            log "ERROR" "Failed to mirror FBC"
-            log "ERROR" "Source: $FBC_SOURCE_IMAGE"
-            log "ERROR" "Target: $fbc_target"
-            log "ERROR" "Error output:"
-            echo "$mirror_output" >&2
-            exit 1
-        fi
-        log "SUCCESS" "FBC image mirrored successfully"
-    else
-        fbc_target="${FBC_SOURCE_IMAGE}"
-    fi
-    
-    log "INFO" "Rendering FBC: $FBC_SOURCE_IMAGE"
-    opm_output=$(opm render "$FBC_SOURCE_IMAGE") || { log "ERROR" "opm render failed"; exit 1; }
-    
-    log "INFO" "Finding latest bundle version..."
-    latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-    [[ -z "$latest_bundle" ]] && { log "ERROR" "No bundle found"; exit 1; }
-    
-    log "INFO" "Extracting bundle data..."
-    bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-    
-    log "INFO" "Extracting operator metadata..."
-    OPERATOR_NAME=$(echo "$bundle_data" | jq -r '.package // empty' | head -1)
-    [[ -z "$OPERATOR_NAME" ]] && { log "ERROR" "Could not extract operator name from bundle"; exit 1; }
-    
-    OPERATOR_NAMESPACE=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' | head -1)
-    if [[ -z "$OPERATOR_NAMESPACE" ]]; then
-        OPERATOR_NAMESPACE="openshift-${OPERATOR_NAME}"
-        NAMESPACE_SOURCE="derived from operator name"
-    else
-        NAMESPACE_SOURCE="from FBC annotation"
-    fi
-    
-    default_channel=$(echo "$opm_output" | jq -r 'select(.schema == "olm.package") | .defaultChannel // "stable"' | head -1)
-    [[ -z "$default_channel" ]] && default_channel="stable"
-    
-    install_mode=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.installModes[]? | select(.supported == true) | .type' | head -1)
-    [[ -z "$install_mode" ]] && install_mode="SingleNamespace"
-    
-    {
-        echo "Operator Name:    ${OPERATOR_NAME}"
-        echo "Bundle Name:      ${latest_bundle}"
-        echo "Namespace:        ${OPERATOR_NAMESPACE} (${NAMESPACE_SOURCE})"
-        echo "Channel:          ${default_channel}"
-        echo "Install Mode:     ${install_mode}"
-        echo ""
-        echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u | nl -w2 -s'. '
-    } | display_metadata
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        echo "Mirroring related images..."
-        image_count=0
-        total_images=$(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | wc -l)
-        
-        while IFS= read -r image; do
-            [[ -z "$image" ]] && continue
-            digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}' || continue)
-            [[ -z "$digest" ]] && continue
-            
-            ((image_count++))
-            echo "  [$image_count/$total_images] Mirroring $digest..."
-            source="${ART_IMAGES_SOURCE}@${digest}"
-            target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-            
-            mirror_output=$(oc image mirror --keep-manifest-list=true "$source" "$target" </dev/null 2>&1)
-            mirror_status=$?
-            
-            if [[ $mirror_status -eq 0 ]]; then
-                echo "$mirror_output" | tail -2
-                echo "    ✓ Success"
-            else
-                echo "ERROR: Failed to mirror image" >&2
-                echo "$mirror_output" | tail -10 >&2
-                echo "  Source: $source" >&2
-                echo "  Target: $target" >&2
-                echo "  Digest: $digest" >&2
-                exit 1
-            fi
-        done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u)
-        echo "Successfully mirrored all $image_count images"
-    fi
-fi
+done
 
 # Create IDMS
 log_step "IDMS" "Creating Image Digest Mirror Sets (IDMS)"
 
-if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    # Create separate IDMS for each operator
-    log "INFO" "Generating IDMS for each operator"
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-        IDMS_SUFFIX="internal-idms"
-    else
-        IDMS_MIRROR="${ART_IMAGES_SOURCE}"
-        IDMS_SUFFIX="art-idms"
-    fi
-    
-    # Store IDMS YAMLs in temp files
-    declare -A OPERATOR_IDMS_FILES
-    
-    # Loop 1: Generate all IDMS YAMLs
-    for op in "${OPERATORS[@]}"; do
+# Create separate IDMS for each deployment key
+log "INFO" "Generating IDMS for each operator/FBC tag"
+
+if [[ "$DISCONNECTED" == true ]]; then
+    IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+    IDMS_SUFFIX="internal-idms"
+else
+    IDMS_MIRROR="${ART_IMAGES_SOURCE}"
+    IDMS_SUFFIX="art-idms"
+fi
+
+# Store IDMS YAMLs in temp files
+declare -A OPERATOR_IDMS_FILES
+
+# Loop 1: Generate all IDMS YAMLs
+for op in "${DEPLOYMENT_KEYS[@]}"; do
         fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
-        idms_name="${op}-${IDMS_SUFFIX}"
+        # Sanitize the deployment key for use in IDMS name
+        sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
+        idms_name="${sanitized_key}-${IDMS_SUFFIX}"
         
         echo "  Generating IDMS: $idms_name"
         
@@ -882,54 +805,23 @@ spec:
         } > "$idms_file"
     done
     
-    # Loop 2: Apply all IDMS YAMLs to cluster
-    echo ""
-    echo "Applying all IDMS to cluster..."
-    for op in "${OPERATORS[@]}"; do
-        idms_file="${OPERATOR_IDMS_FILES[$op]}"
-        idms_name="${op}-${IDMS_SUFFIX}"
-        echo "  Applying IDMS: $idms_name"
-        oc apply -f "$idms_file" || { echo "ERROR: IDMS apply failed for $op" >&2; exit 1; }
-        rm -f "$idms_file"
-    done
-    
-    log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
-    oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
-    log "SUCCESS" "Machine Config Pool update completed"
-    
-else
-    # Single operator IDMS
-    log "INFO" "Generating IDMS for single operator"
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        IDMS_NAME=$(echo "$CATALOG_NAME" | sed 's/-konflux$//')-internal-idms
-        IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-    else
-        IDMS_NAME=$(echo "$CATALOG_NAME" | sed 's/-konflux$//')-art-idms
-        IDMS_MIRROR="${ART_IMAGES_SOURCE}"
-    fi
-    
-    {
-    echo "apiVersion: config.openshift.io/v1
-kind: ImageDigestMirrorSet
-metadata:
-  name: ${IDMS_NAME}
-spec:
-  imageDigestMirrors:"
-    while IFS= read -r repo; do
-        [[ -z "$repo" ]] && continue
-        echo "  - mirrors:
-    - ${IDMS_MIRROR}
-    source: $repo"
-    done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sed 's/@sha256:[a-f0-9]\{64\}$//' | sort -u)
-    } | oc apply -f - || { log "ERROR" "IDMS apply failed"; exit 1; }
-    
-    log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
-    oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
-    log "SUCCESS" "Machine Config Pool update completed"
-fi
+# Loop 2: Apply all IDMS YAMLs to cluster
+echo ""
+echo "Applying all IDMS to cluster..."
+for op in "${DEPLOYMENT_KEYS[@]}"; do
+    idms_file="${OPERATOR_IDMS_FILES[$op]}"
+    # Sanitize the deployment key for use in IDMS name
+    sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
+    idms_name="${sanitized_key}-${IDMS_SUFFIX}"
+    echo "  Applying IDMS: $idms_name"
+    oc apply -f "$idms_file" || { echo "ERROR: IDMS apply failed for $op" >&2; exit 1; }
+    rm -f "$idms_file"
+done
+
+log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
+oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
+oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
+log "SUCCESS" "Machine Config Pool update completed"
 
 # Add insecure registry
 log "INFO" "Configuring cluster settings"
@@ -954,15 +846,14 @@ log "SUCCESS" "Default catalogs disabled"
 # Deploy operators
 log_step "DEPLOY" "Starting Operator Deployment"
 
-if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    # Deploy multiple operators
-    log "INFO" "Deploying ${#OPERATORS[@]} operator(s)"
-    
-    # Arrays to track deployment status
-    declare -a FAILED_OPERATORS=()
-    declare -a SUCCESS_OPERATORS=()
-    
-    for op in "${OPERATORS[@]}"; do
+# Deploy all operators/FBC tags
+log "INFO" "Deploying ${#DEPLOYMENT_KEYS[@]} operator(s)/FBC tag(s)"
+
+# Arrays to track deployment status
+declare -a FAILED_OPERATORS=()
+declare -a SUCCESS_OPERATORS=()
+
+for op in "${DEPLOYMENT_KEYS[@]}"; do
       
         catalog_name="${OPERATOR_CATALOG_NAMES[$op]}"
         fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
@@ -996,39 +887,26 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
         set -e
         
         # Record result
-        if [[ "$deployment_failed" == true ]]; then
-            FAILED_OPERATORS+=("$op")
-            log "ERROR" "Operator $op deployment failed, continuing with next operator..."
-        else
-            SUCCESS_OPERATORS+=("$op")
-            log "SUCCESS" "Operator $op deployed successfully"
-        fi
-    done
-    
-    log_step "SUMMARY" "Deployment Summary"
-    
-    if [[ ${#SUCCESS_OPERATORS[@]} -gt 0 ]]; then
-        log "SUCCESS" "Successfully deployed (${#SUCCESS_OPERATORS[@]}): ${SUCCESS_OPERATORS[*]}"
-    fi
-    
-    if [[ ${#FAILED_OPERATORS[@]} -gt 0 ]]; then
-        log "ERROR" "Failed to deploy (${#FAILED_OPERATORS[@]}): ${FAILED_OPERATORS[*]}"
-        log "ERROR" "Deployment completed with errors!"
-        exit 1
+    if [[ "$deployment_failed" == true ]]; then
+        FAILED_OPERATORS+=("$op")
+        log "ERROR" "Operator $op deployment failed, continuing with next operator..."
     else
-        log "SUCCESS" "All operators deployed successfully!"
+        SUCCESS_OPERATORS+=("$op")
+        log "SUCCESS" "Operator $op deployed successfully"
     fi
-    
-else
-    # Deploy single operator (original behavior)
-    if [[ "$DEPLOY_CATALOG_SOURCE" == true ]]; then
-        # Deploy CatalogSource
-        deploy_catalog_source "$CATALOG_NAME" "$fbc_target" "single-operator" || { log "ERROR" "Failed to deploy CatalogSource"; exit 1; }
-    fi
+done
 
-    if [[ "$DEPLOY_OPERATOR" == true ]]; then
-        # Deploy Operator
-        deploy_operator "single-operator" "$OPERATOR_NAME" "$OPERATOR_NAMESPACE" "$latest_bundle" "$default_channel" "$install_mode" "$CATALOG_NAME" || { log "ERROR" "Failed to deploy operator"; exit 1; }
-    fi
+log_step "SUMMARY" "Deployment Summary"
+
+if [[ ${#SUCCESS_OPERATORS[@]} -gt 0 ]]; then
+    log "SUCCESS" "Successfully deployed (${#SUCCESS_OPERATORS[@]}): ${SUCCESS_OPERATORS[*]}"
+fi
+
+if [[ ${#FAILED_OPERATORS[@]} -gt 0 ]]; then
+    log "ERROR" "Failed to deploy (${#FAILED_OPERATORS[@]}): ${FAILED_OPERATORS[*]}"
+    log "ERROR" "Deployment completed with errors!"
+    exit 1
+else
+    log "SUCCESS" "All operators deployed successfully!"
 fi
 
