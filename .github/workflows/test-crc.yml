@@ -261,16 +261,23 @@ jobs:
           crc config set cpus 4        # Reduce CPUs to match available resources
           crc config set disk-size 50  # Reduce disk size
           
+          # Set CRC cache directory to /mnt which has more space (66GB available)
+          # This avoids "no space left on device" errors during bundle extraction
+          export CRC_CACHE_DIR=/mnt/crc-cache
+          mkdir -p "$CRC_CACHE_DIR"
+          echo "CRC cache directory set to: $CRC_CACHE_DIR"
+          df -h "$CRC_CACHE_DIR"
+          
           # Setup CRC (download and extract bundle)
           # Use 'sg libvirt' to run in libvirt group context (non-interactive)
           # sg works because user is already in libvirt group (added in Install dependencies)
-          sg libvirt -c "crc setup" || {
+          sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc setup" || {
             echo "Warning: sg failed, trying runuser..."
-            sudo runuser -u $USER -g libvirt -- crc setup || {
+            sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc setup" || {
               echo "Warning: runuser failed, trying direct crc setup..."
-              crc setup || {
+              CRC_CACHE_DIR=$CRC_CACHE_DIR crc setup || {
                 echo "CRC setup failed. Attempting to work around group check..."
-                CRC_SKIP_CHECK_LIBVIRT_GROUP=true crc setup || true
+                CRC_CACHE_DIR=$CRC_CACHE_DIR CRC_SKIP_CHECK_LIBVIRT_GROUP=true crc setup || true
               }
             }
           }
@@ -299,6 +306,16 @@ jobs:
             echo "Please add your pull secret to GitHub secrets."
           fi
           
+          # Set CRC cache directory to /mnt which has more space (66GB available)
+          export CRC_CACHE_DIR=/mnt/crc-cache
+          mkdir -p "$CRC_CACHE_DIR"
+          echo "CRC cache directory set to: $CRC_CACHE_DIR"
+          
+          # Clean up any incomplete extractions from previous attempts
+          echo "Cleaning up incomplete CRC extractions..."
+          rm -rf ~/.crc/cache/tmp-extract/* || true
+          rm -rf "$CRC_CACHE_DIR/tmp-extract/*" || true
+          
           # Clean up disk space before starting CRC (GitHub Actions runners have limited disk space)
           echo "Cleaning up disk space before starting CRC..."
           df -h
@@ -312,6 +329,8 @@ jobs:
           # Show available disk space
           echo "Available disk space after cleanup:"
           df -h
+          echo "CRC cache directory space:"
+          df -h "$CRC_CACHE_DIR"
           
           # Ensure crc-admin-helper has correct permissions (SUID bit and root ownership required)
           # Double-check permissions before starting CRC
@@ -346,36 +365,41 @@ jobs:
           
           # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
           # Note: sg libvirt requires the user to be in the libvirt group (already done in Install dependencies step)
+          # Use CRC_CACHE_DIR to ensure we use the cache directory with more space
           CRC_START_SUCCESS=false
           if [ -n "$CRC_PULL_SECRET" ]; then
-            echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+            echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
               echo "Warning: sg failed, trying runuser..."
-              echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c 'crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt' && CRC_START_SUCCESS=true || {
+              echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
                 echo "Warning: runuser failed, trying direct crc start with sg..."
                 # Last resort: try direct with sg (may fail on group check but worth trying)
-                echo "$CRC_PULL_SECRET" | sg libvirt -c "crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+                echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
                   echo "ERROR: All attempts to start CRC failed!"
                   echo "Checking CRC status..."
                   crc status || true
                   echo "Checking disk space..."
                   df -h
+                  echo "Checking CRC cache directory space..."
+                  df -h "$CRC_CACHE_DIR" || true
                   exit 1
                 }
               }
             }
           else
             # Try to start without pull secret using sg libvirt
-            sg libvirt -c "crc start" && CRC_START_SUCCESS=true || {
+            sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start" && CRC_START_SUCCESS=true || {
               echo "Warning: sg failed, trying runuser..."
-              sudo runuser -u $USER -g libvirt -- crc start && CRC_START_SUCCESS=true || {
+              sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start" && CRC_START_SUCCESS=true || {
                 echo "Warning: runuser failed, trying direct crc start with sg..."
                 # Last resort: try direct with sg (may fail on group check but worth trying)
-                sg libvirt -c "crc start" && CRC_START_SUCCESS=true || {
+                sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start" && CRC_START_SUCCESS=true || {
                   echo "ERROR: All attempts to start CRC failed!"
                   echo "Checking CRC status..."
                   crc status || true
                   echo "Checking disk space..."
                   df -h
+                  echo "Checking CRC cache directory space..."
+                  df -h "$CRC_CACHE_DIR" || true
                   exit 1
                 }
               }
