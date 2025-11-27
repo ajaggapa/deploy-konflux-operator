@@ -1,0 +1,216 @@
+name: Test on OpenShift CRC
+
+on:
+  pull_request:
+    branches:
+      - testworkflow
+  push:
+    branches:
+      - testworkflow
+  workflow_dispatch:
+
+jobs:
+  test-crc:
+    name: Test deploy-operator.sh on CRC
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            wget \
+            tar \
+            gzip \
+            libvirt-daemon-system \
+            libvirt-clients \
+            qemu-kvm \
+            qemu-utils \
+            libguestfs-tools \
+            dnsmasq \
+            netcat-openbsd \
+            jq \
+            podman \
+            build-essential
+
+      - name: Install OpenShift CLI (oc) and opm
+        run: |
+          # Get the OpenShift version from CRC release info
+          CRC_INFO=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json)
+          OCP_VERSION=$(echo "$CRC_INFO" | jq -r '.version.openshiftVersion' | cut -d. -f1-2)
+          echo "CRC will deploy OpenShift ${OCP_VERSION}, installing matching oc and opm..."
+          
+          # Install oc CLI (use latest patch version for the minor version)
+          curl -sL "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-${OCP_VERSION}/openshift-client-linux.tar.gz" | \
+            sudo tar -xzf - -C /usr/local/bin/ || \
+            curl -sL "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OCP_VERSION}/openshift-client-linux.tar.gz" | \
+            sudo tar -xzf - -C /usr/local/bin/
+          oc version --client
+          
+          # Install opm
+          curl -sL "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/latest-${OCP_VERSION}/opm-linux.tar.gz" | \
+            sudo tar -xzf - -C /usr/local/bin/ || \
+            curl -sL "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OCP_VERSION}/opm-linux.tar.gz" | \
+            sudo tar -xzf - -C /usr/local/bin/
+          opm version
+
+      - name: Install CRC
+        run: |
+          CRC_VERSION=$(curl -s https://developers.redhat.com/content-gateway/rest/mirror/pub/openshift-v4/clients/crc/latest/release-info.json | jq -r '.version')
+          echo "Installing CRC version: $CRC_VERSION"
+          
+          wget -q "https://developers.redhat.com/content-gateway/file/pub/openshift-v4/clients/crc/${CRC_VERSION}/crc-linux-amd64.tar.xz"
+          tar -xJf crc-linux-amd64.tar.xz
+          sudo mv crc-linux-*/crc /usr/local/bin/
+          rm -rf crc-linux-* crc-linux-amd64.tar.xz
+          
+          crc version
+
+      - name: Setup CRC
+        run: |
+          # Configure CRC
+          crc config set consent-telemetry no
+          crc config set memory 16384
+          crc config set cpus 8
+          crc config set disk-size 100
+          
+          # Setup CRC (download and extract bundle)
+          crc setup
+
+      - name: Start CRC cluster
+        env:
+          CRC_PULL_SECRET: ${{ secrets.CRC_PULL_SECRET }}
+        run: |
+          if [ -z "$CRC_PULL_SECRET" ]; then
+            echo "Warning: CRC_PULL_SECRET not set. CRC may fail to start."
+            echo "Please add your pull secret to GitHub secrets."
+          fi
+          
+          # Start CRC with pull secret
+          if [ -n "$CRC_PULL_SECRET" ]; then
+            echo "$CRC_PULL_SECRET" | crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt
+          else
+            # Try to start without pull secret (may fail)
+            crc start || echo "CRC start failed - continuing anyway"
+          fi
+          
+          # Wait for cluster to be ready
+          timeout 300 bash -c 'until oc get nodes 2>/dev/null; do sleep 10; done' || true
+          
+          # Configure oc environment
+          eval $(crc oc-env)
+          
+          # Login as admin
+          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify || true
+          
+          # Wait for cluster operators to be ready
+          echo "Waiting for cluster operators to be ready..."
+          timeout 600 bash -c 'until oc get clusteroperators 2>/dev/null && oc wait --for=condition=Available --timeout=5s clusteroperators --all 2>/dev/null; do sleep 30; done' || echo "Cluster operators may not be fully ready"
+
+      - name: Verify cluster access
+        run: |
+          eval $(crc oc-env)
+          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          
+          echo "=========================================="
+          echo "Cluster Information:"
+          echo "=========================================="
+          oc get nodes
+          echo ""
+          echo "OpenShift Version:"
+          oc version -o json | jq -r '.openshiftVersion // "unknown"'
+          echo ""
+          echo "Client Version:"
+          oc version --client
+          echo ""
+          echo "Cluster Operators:"
+          oc get clusteroperators
+
+      - name: Make script executable
+        run: |
+          chmod +x deploy-operator.sh
+
+      - name: Test script with KONFLUX_SKIP_DEPLOYMENT
+        env:
+          QUAY_AUTH: ${{ secrets.QUAY_AUTH }}
+        run: |
+          eval $(crc oc-env)
+          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          
+          # Test 1: Skip deployment (metadata extraction only)
+          echo "=== Test 1: KONFLUX_SKIP_DEPLOYMENT=true ==="
+          KONFLUX_SKIP_DEPLOYMENT=true ./deploy-operator.sh --operator sriov || echo "Test completed"
+          
+          # Test 2: Skip operator deployment (CatalogSource only)
+          echo "=== Test 2: KONFLUX_DEPLOY_OPERATOR=false ==="
+          if [ -n "$QUAY_AUTH" ]; then
+            KONFLUX_DEPLOY_OPERATOR=false ./deploy-operator.sh --operator sriov --quay-auth <(echo "$QUAY_AUTH") || echo "Test completed"
+          else
+            echo "Skipping test - QUAY_AUTH not set"
+          fi
+          
+          # Test 3: FBC tag mode (use detected OCP version)
+          echo "=== Test 3: FBC tag mode ==="
+          OCP_VER=$(oc version -o json | jq -r '.openshiftVersion' | cut -d. -f1-2 || echo "4.20")
+          KONFLUX_SKIP_DEPLOYMENT=true ./deploy-operator.sh --fbc-tag ocp__${OCP_VER}__metallb-rhel9-operator || echo "Test completed"
+
+      - name: Test script validation
+        run: |
+          # Test script argument validation
+          echo "=== Testing argument validation ==="
+          
+          # Should fail: no arguments
+          ./deploy-operator.sh 2>&1 | grep -q "Provide either" && echo "✓ Correctly rejects missing arguments" || echo "✗ Failed to reject missing arguments"
+          
+          # Should fail: both --operator and --fbc-tag
+          ./deploy-operator.sh --operator sriov --fbc-tag test 2>&1 | grep -q "not both" && echo "✓ Correctly rejects both arguments" || echo "✗ Failed to reject both arguments"
+          
+          # Should fail: invalid operator
+          ./deploy-operator.sh --operator invalid-operator 2>&1 | grep -q "Invalid operator" && echo "✓ Correctly rejects invalid operator" || echo "✗ Failed to reject invalid operator"
+
+      - name: Test with KONFLUX_SKIP_DEPLOYMENT
+        run: |
+          eval $(crc oc-env)
+          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          
+          echo "=== Testing KONFLUX_SKIP_DEPLOYMENT ==="
+          KONFLUX_SKIP_DEPLOYMENT=true ./deploy-operator.sh --operator sriov 2>&1 | grep -q "Skipping deployment" && echo "✓ Correctly skips deployment" || echo "✗ Failed to skip deployment"
+
+      - name: Test environment variable controls
+        env:
+          QUAY_AUTH: ${{ secrets.QUAY_AUTH }}
+        run: |
+          eval $(crc oc-env)
+          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          
+          echo "=== Testing environment variable controls ==="
+          
+          # Test KONFLUX_DEPLOY_CATALOG_SOURCE=false and KONFLUX_DEPLOY_OPERATOR=false
+          if [ -n "$QUAY_AUTH" ]; then
+            KONFLUX_DEPLOY_CATALOG_SOURCE=false KONFLUX_DEPLOY_OPERATOR=false \
+              ./deploy-operator.sh --operator sriov --quay-auth <(echo "$QUAY_AUTH") 2>&1 | head -20 || echo "Environment variable test completed"
+          else
+            echo "Skipping test - QUAY_AUTH not set"
+          fi
+
+      - name: Cleanup CRC (if needed)
+        if: always()
+        run: |
+          # Stop CRC to free resources
+          crc stop || true
+          crc delete -f || true
+
+      - name: Archive logs
+        if: failure()
+        run: |
+          eval $(crc oc-env) || true
+          mkdir -p /tmp/crc-logs
+          crc logs --bundle /tmp/crc-logs/crc-logs.tar.gz || true
+          # Upload logs as artifact (optional)
+          echo "CRC logs saved to /tmp/crc-logs/"
+

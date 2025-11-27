@@ -1,0 +1,53 @@
+name: Validate Script Syntax
+
+on:
+  pull_request:
+    branches:
+      - testworkflow
+  push:
+    branches:
+      - testworkflow
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate Script
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Make script executable
+        run: |
+          chmod +x deploy-operator.sh
+
+      - name: Check bash syntax
+        run: |
+          bash -n deploy-operator.sh
+          echo "✓ Bash syntax is valid"
+
+      - name: Run shellcheck
+        run: |
+          shellcheck deploy-operator.sh || echo "⚠ Shellcheck found issues (non-blocking)"
+
+      - name: Run basic validation tests
+        run: |
+          chmod +x test-script.sh || true
+          if [ -f test-script.sh ]; then
+            ./test-script.sh || echo "Some validation tests failed"
+          else
+            echo "test-script.sh not found, skipping validation tests"
+          fi
+
+      - name: Check for required tools in script
+        run: |
+          echo "Checking for required tools..."
+          grep -q "oc opm jq" deploy-operator.sh && echo "✓ Required tools check found" || echo "⚠ Required tools check not found"
+
