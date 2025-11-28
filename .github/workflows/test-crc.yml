@@ -380,17 +380,23 @@ jobs:
             exit 1
           fi
           
+          # Write pull secret to a temporary file first (required when using sg/runuser)
+          # This is necessary because stdin redirection doesn't work with sg/runuser
+          PULL_SECRET_FILE=$(mktemp)
+          echo "$CRC_PULL_SECRET" > "$PULL_SECRET_FILE"
+          chmod 600 "$PULL_SECRET_FILE"
+          
           # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
           # Note: sg libvirt requires the user to be in the libvirt group (already done in Install dependencies step)
           # Use CRC_CACHE_DIR to ensure we use the cache directory with more space
           # CRC_PULL_SECRET is required (checked above), so we always use it
           CRC_START_SUCCESS=false
-          echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+          sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file $PULL_SECRET_FILE -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
             echo "Warning: sg failed, trying runuser..."
-            echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
-              echo "Warning: runuser failed, trying direct crc start with sg..."
-              # Last resort: try direct with sg (may fail on group check but worth trying)
-              echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+            sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file $PULL_SECRET_FILE -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+              echo "Warning: runuser failed, trying direct crc start..."
+              # Last resort: try direct (may fail on group check but worth trying)
+              CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file "$PULL_SECRET_FILE" -p ~/.crc/pull-secret.txt && CRC_START_SUCCESS=true || {
                 echo "ERROR: All attempts to start CRC failed!"
                 echo "Checking CRC status..."
                 crc status || true
@@ -398,10 +404,14 @@ jobs:
                 df -h
                 echo "Checking CRC cache directory space..."
                 df -h "$CRC_CACHE_DIR" || true
+                rm -f "$PULL_SECRET_FILE"
                 exit 1
               }
             }
           }
+          
+          # Clean up pull secret file
+          rm -f "$PULL_SECRET_FILE"
           
           if [ "$CRC_START_SUCCESS" = "true" ]; then
             echo "CRC started successfully!"
