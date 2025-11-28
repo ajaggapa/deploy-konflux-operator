@@ -33,12 +33,29 @@ jobs:
             libvirt-clients \
             qemu-kvm \
             qemu-utils \
+            qemu-system-common \
             libguestfs-tools \
             dnsmasq \
             netcat-openbsd \
             jq \
             podman \
             build-essential
+          
+          # Ensure virtiofsd is available (required for CRC)
+          # virtiofsd is typically in qemu-system-common or qemu-utils
+          if ! command -v virtiofsd &> /dev/null; then
+            echo "virtiofsd not found in PATH, checking for package..."
+            # Try to find and install the package containing virtiofsd
+            sudo apt-get install -y qemu-system-common || true
+            # Verify virtiofsd is available
+            if ! command -v virtiofsd &> /dev/null; then
+              echo "Warning: virtiofsd still not found, but continuing..."
+            else
+              echo "virtiofsd found: $(which virtiofsd)"
+            fi
+          else
+            echo "virtiofsd found: $(which virtiofsd)"
+          fi
           
           # Add user to libvirt group early so it's available for CRC setup
           sudo usermod -a -G libvirt $USER
