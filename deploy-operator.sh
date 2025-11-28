@@ -5,10 +5,10 @@ set -Eeuo pipefail
 # See --operator flag for valid operators
 VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage"
 
-KONFLUX_SKIP_DEPLOYMENT="${KONFLUX_SKIP_DEPLOYMENT:-false}"
-# Env variables to control the deployment of CatalogSource and Operator
+KONFLUX_DEPLOY_OPERATORS="${KONFLUX_DEPLOY_OPERATORS:-true}"
+# Env variables to control the deployment of CatalogSource and Subscription
 KONFLUX_DEPLOY_CATALOG_SOURCE="${KONFLUX_DEPLOY_CATALOG_SOURCE:-true}"
-KONFLUX_DEPLOY_OPERATOR="${KONFLUX_DEPLOY_OPERATOR:-true}"
+KONFLUX_DEPLOY_SUBSCRIPTION="${KONFLUX_DEPLOY_SUBSCRIPTION:-true}"
 
 # Color codes for logging
 CYAN='\033[0;36m'
@@ -76,8 +76,8 @@ display_metadata() {
     echo "============================================================"
 }
 
-if [[ "$KONFLUX_SKIP_DEPLOYMENT" == true ]]; then
-    log "INFO" "Skipping deployment due to KONFLUX_SKIP_DEPLOYMENT flag"
+if [[ "$KONFLUX_DEPLOY_OPERATORS" == false ]]; then
+    log "INFO" "Skipping deployment due to KONFLUX_DEPLOY_OPERATORS flag"
     exit 0
 fi
 
@@ -875,7 +875,7 @@ for op in "${DEPLOYMENT_KEYS[@]}"; do
         fi
     fi
 
-    if [[ "$KONFLUX_DEPLOY_OPERATOR" == true && "$deployment_failed" == false ]]; then
+    if [[ "$KONFLUX_DEPLOY_SUBSCRIPTION" == true && "$deployment_failed" == false ]]; then
         # Deploy Operator
         if ! deploy_operator "$op" "$operator_name" "$operator_namespace" "$latest_bundle" "$default_channel" "$install_mode" "$catalog_name"; then
             deployment_failed=true
