@@ -1,0 +1,48 @@
+name: Syntax Check
+
+on:
+  push:
+    branches:
+      - main
+      - testworkflow
+  pull_request:
+    branches:
+      - main
+      - testworkflow
+
+jobs:
+  syntax-check:
+    name: Check Shell Script Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Check bash syntax
+        run: |
+          echo "Checking bash syntax for deploy-operator.sh..."
+          bash -n deploy-operator.sh
+          echo "✓ Bash syntax check passed"
+
+      - name: Run shellcheck
+        run: |
+          echo "Running shellcheck on deploy-operator.sh..."
+          shellcheck deploy-operator.sh || {
+            echo "⚠ shellcheck found issues (non-blocking)"
+            exit 0
+          }
+          echo "✓ Shellcheck passed"
+
+      - name: Check script is executable
+        run: |
+          if [ ! -x deploy-operator.sh ]; then
+            echo "⚠ Warning: deploy-operator.sh is not executable"
+          else
+            echo "✓ Script is executable"
+          fi
+
