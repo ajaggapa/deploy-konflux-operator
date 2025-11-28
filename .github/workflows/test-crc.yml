@@ -41,35 +41,38 @@ jobs:
             podman \
             build-essential
           
-          # Ensure virtiofsd is available (required for CRC)
-          # On Ubuntu, virtiofsd is typically in qemu-system-x86 or needs to be built
-          # First, try to find existing virtiofsd
-          VIRTIOFSD_PATH=$(find /usr -name virtiofsd 2>/dev/null | head -1)
+          # Install virtiofsd - REQUIRED for CRC to work with virtiofs
+          # On Ubuntu 22.04+, virtiofsd is a STANDALONE package (not in qemu packages)
+          echo "Installing virtiofsd package (required for CRC)..."
+          sudo apt-get install -y virtiofsd || {
+            echo "virtiofsd package not found, trying alternative installation..."
+            # Try installing from universe repository
+            sudo add-apt-repository -y universe || true
+            sudo apt-get update
+            sudo apt-get install -y virtiofsd || {
+              echo "Still failed, trying to install from Rust/cargo..."
+              # Install Rust and build virtiofsd from source as last resort
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+              source $HOME/.cargo/env
+              cargo install virtiofsd || true
+            }
+          }
           
-          if [ -z "$VIRTIOFSD_PATH" ]; then
-            echo "virtiofsd not found, installing qemu packages that may contain it..."
-            # Install all qemu system packages that might contain virtiofsd
-            sudo apt-get install -y qemu-system-x86 qemu-system-data qemu-system-common || true
-            
-            # Search again
-            VIRTIOFSD_PATH=$(find /usr -name virtiofsd 2>/dev/null | head -1)
-          fi
-          
-          if [ -n "$VIRTIOFSD_PATH" ] && [ -f "$VIRTIOFSD_PATH" ]; then
-            echo "Found virtiofsd at: $VIRTIOFSD_PATH"
-            sudo chmod +x "$VIRTIOFSD_PATH" || true
-            # Create symlink in /usr/bin if not already there for easier access
-            if [ "$VIRTIOFSD_PATH" != "/usr/bin/virtiofsd" ] && [ ! -f /usr/bin/virtiofsd ]; then
-              sudo ln -sf "$VIRTIOFSD_PATH" /usr/bin/virtiofsd || true
-              echo "Created symlink: /usr/bin/virtiofsd -> $VIRTIOFSD_PATH"
-            fi
+          # Verify virtiofsd is installed
+          if command -v virtiofsd &> /dev/null; then
+            echo "virtiofsd installed successfully: $(which virtiofsd)"
+            virtiofsd --version || true
           else
-            echo "ERROR: virtiofsd not found after installation attempts!"
-            echo "This will cause CRC to fail. Checking available qemu packages..."
-            dpkg -l | grep qemu || true
-            echo "Attempting to build virtiofsd from qemu source or use workaround..."
-            # Last resort: try to download pre-built virtiofsd or configure CRC differently
-            # For now, we'll let CRC fail and see the exact error
+            # Search for it in common locations
+            VIRTIOFSD_PATH=$(find /usr -name virtiofsd -type f 2>/dev/null | head -1)
+            if [ -n "$VIRTIOFSD_PATH" ]; then
+              echo "Found virtiofsd at: $VIRTIOFSD_PATH"
+              sudo ln -sf "$VIRTIOFSD_PATH" /usr/bin/virtiofsd || true
+            else
+              echo "ERROR: virtiofsd not found! CRC will fail."
+              echo "Available packages:"
+              apt-cache search virtiofsd || true
+            fi
           fi
           
           # Add user to libvirt group early so it's available for CRC setup
