@@ -9,6 +9,12 @@ on:
     branches:
       - main
       - testworkflow
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check (optional)'
+        required: false
+        type: string
 
 jobs:
   syntax-check:
@@ -17,6 +23,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # For PRs, checkout the PR branch
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install shellcheck
         run: |
