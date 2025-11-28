@@ -2,6 +2,14 @@
 
 set -Eeuo pipefail
 
+# See --operator flag for valid operators
+VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage"
+
+KONFLUX_DEPLOY_OPERATORS="${KONFLUX_DEPLOY_OPERATORS:-true}"
+# Env variables to control the deployment of CatalogSource and Subscription
+KONFLUX_DEPLOY_CATALOG_SOURCE="${KONFLUX_DEPLOY_CATALOG_SOURCE:-true}"
+KONFLUX_DEPLOY_SUBSCRIPTION="${KONFLUX_DEPLOY_SUBSCRIPTION:-true}"
+
 # Color codes for logging
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -68,6 +76,11 @@ display_metadata() {
     echo "============================================================"
 }
 
+if [[ "$KONFLUX_DEPLOY_OPERATORS" == false ]]; then
+    log "INFO" "Skipping deployment due to KONFLUX_DEPLOY_OPERATORS flag"
+    exit 0
+fi
+
 # Parse arguments
 log_step "INIT" "Starting Konflux Operator Deployment"
 log "INFO" "Using MCP timeout: ${MCP_TIMEOUT:-600s}"
@@ -79,7 +92,8 @@ MCP_TIMEOUT="${MCP_TIMEOUT:-600s}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --operator) 
+        --operator)
+            # This argument is checked against the VALID_OPERATORS list
             OPERATOR="$2"
             log "INFO" "Operator specified: $2"
             shift 2 
@@ -118,6 +132,8 @@ done
 
 log "INFO" "Validating operator configuration"
 
+
+
 if [[ -n "${OPERATOR:-}" && -n "${FBC_TAG_INPUT:-}" ]]; then
     log "ERROR" "Provide either --operator or --fbc-tag, not both"
     exit 1
@@ -134,7 +150,6 @@ if [[ -n "${OPERATOR:-}" ]]; then
     log "INFO" "Parsing operators: ${OPERATORS[*]}"
     
     # Validate all operators are in predefined list
-    VALID_OPERATORS="sriov metallb nmstate ptp pfstatus"
     for op in "${OPERATORS[@]}"; do
         if [[ ! " $VALID_OPERATORS " =~ " $op " ]]; then
             log "ERROR" "Invalid operator: $op"
@@ -144,6 +159,9 @@ if [[ -n "${OPERATOR:-}" ]]; then
     done
     log "SUCCESS" "Operators to deploy: ${OPERATORS[*]}"
 else
+    # FBC tag mode: parse comma-separated FBC tags and use them directly
+    IFS=',' read -ra FBC_TAGS <<< "$FBC_TAG_INPUT"
+    log "INFO" "Parsed FBC tags: ${FBC_TAGS[*]}"
     OPERATORS=()
     log "INFO" "No operators specified, will use FBC tag mode"
 fi
@@ -228,15 +246,198 @@ get_fbc_tag() {
         nmstate) echo "ocp__${ver}__kubernetes-nmstate-rhel9-operator" ;;
         ptp) echo "ocp__${ver}__ose-ptp-rhel9-operator" ;;
         pfstatus) echo "ocp__${ver}__pf-status-relay-rhel9-operator" ;;
+        local-storage) echo "ocp__${ver}__ose-local-storage-rhel9-operator" ;;
         *) echo "" ;;
     esac
 }
 
+# Helper function to deploy CatalogSource
+deploy_catalog_source() {
+    local catalog_name=$1
+    local fbc_target=$2
+    local op=$3
+
+    echo "------------------------------------------------------------"
+    echo "Deploying CatalogSource for $op..."
+    echo "------------------------------------------------------------"
+
+    log "INFO" "Cleaning up existing CatalogSource for $op..."
+    log "INFO" "  - Deleting CatalogSource: $catalog_name"
+    oc delete catalogsource "$catalog_name" -n openshift-marketplace --ignore-not-found &>/dev/null || true
+    log "SUCCESS" "CatalogSource cleaned up"
+
+    # Create CatalogSource
+    log "INFO" "Creating CatalogSource for $op..."
+    if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ${catalog_name}
+  namespace: openshift-marketplace
+spec:
+  displayName: ${catalog_name}
+  image: ${fbc_target}
+  sourceType: grpc
+EOF
+    then
+        log "ERROR" "CatalogSource apply failed for $op"
+        return 1
+    else
+        log "SUCCESS" "CatalogSource created"
+    fi
+
+    # Wait for catalog ready
+    log "INFO" "Waiting for CatalogSource to be ready..."
+    if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
+        catalogsource "$catalog_name" -n openshift-marketplace --timeout=300s 2>/dev/null; then
+        log "ERROR" "CatalogSource $catalog_name not ready within timeout"
+        return 1
+    else
+        log "SUCCESS" "CatalogSource is ready"
+    fi
+
+    return 0
+}
+
+# Helper function to deploy operator
+deploy_operator() {
+    local op=$1
+    local operator_name=$2
+    local operator_namespace=$3
+    local latest_bundle=$4
+    local default_channel=$5
+    local install_mode=$6
+    local catalog_name=$7
+
+    echo "------------------------------------------------------------"
+    echo "Deploying Operator for $op..."
+    echo "------------------------------------------------------------"
+
+    log "INFO" "Cleaning up existing namespace for $op..."
+    log "INFO" "  - Deleting namespace: $operator_namespace"
+    oc delete namespace "$operator_namespace" --ignore-not-found &>/dev/null || true
+    log "SUCCESS" "Namespace cleaned up"
+
+    # Create namespace
+    log "INFO" "Creating Namespace for $op..."
+    if ! oc apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $operator_namespace
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+EOF
+    then
+        log "ERROR" "Namespace creation failed for $op"
+        return 1
+    fi
+    log "SUCCESS" "Namespace created"
+
+    # Create OperatorGroup
+    log "INFO" "Creating OperatorGroup for $op..."
+    if [[ "$install_mode" == "AllNamespaces" ]]; then
+        if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: operator-group-${operator_name}
+  namespace: ${operator_namespace}
+spec: {}
+EOF
+        then
+            log "ERROR" "OperatorGroup apply failed for $op"
+            return 1
+        fi
+    else
+        if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: operator-group-${operator_name}
+  namespace: ${operator_namespace}
+spec:
+  targetNamespaces:
+  - ${operator_namespace}
+EOF
+        then
+            log "ERROR" "OperatorGroup apply failed for $op"
+            return 1
+        fi
+    fi
+    log "SUCCESS" "OperatorGroup created"
+
+    # Create Subscription
+    log "INFO" "Creating Subscription for $op..."
+    if ! oc apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: ${operator_name}
+  namespace: ${operator_namespace}
+spec:
+  channel: $default_channel
+  installPlanApproval: Automatic
+  name: ${operator_name}
+  source: $catalog_name
+  sourceNamespace: openshift-marketplace
+EOF
+    then
+        log "ERROR" "Subscription apply failed for $op"
+        return 1
+    fi
+    log "SUCCESS" "Subscription created"
+
+    # Wait for subscription to get currentCSV
+    log "INFO" "Waiting for subscription to resolve..."
+    if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${operator_name}" -n "${operator_namespace}" --timeout=120s 2>/dev/null; then
+        log "ERROR" "Subscription did not resolve within timeout"
+        return 1
+    fi
+    log "SUCCESS" "Subscription resolved"
+
+    # Wait for CSV
+    log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
+    csv_timeout=180
+    csv_elapsed=0
+    csv_created=false
+    while [[ $csv_elapsed -lt $csv_timeout ]]; do
+        if oc get csv "$latest_bundle" -n "$operator_namespace" >/dev/null 2>&1; then
+            csv_created=true
+            break
+        fi
+        sleep 2
+        csv_elapsed=$((csv_elapsed + 2))
+    done
+    if [[ "$csv_created" == false ]]; then
+        log "ERROR" "CSV ${latest_bundle} not created within timeout"
+        return 1
+    fi
+    log "SUCCESS" "CSV created"
+
+    log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
+    if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$operator_namespace" --timeout=120s 2>/dev/null; then
+        log "ERROR" "CSV ${latest_bundle} did not reach Succeeded phase"
+        return 1
+    fi
+    log "SUCCESS" "CSV reached Succeeded phase"
+
+    # Wait for operator pods
+    log "INFO" "Waiting for operator pods to be ready..."
+    if ! oc wait --for=condition=Ready pods --all -n "$operator_namespace" --timeout=120s 2>/dev/null; then
+        log "ERROR" "Operator pods not ready within timeout"
+        return 1
+    fi
+    log "SUCCESS" "All operator pods are ready"
+
+    return 0
+}
+
 # Set operator config
 ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
+ART_FBC_BASE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc"
 
 # Arrays to store operator metadata
-declare -A OPERATOR_FBC_TAGS
 declare -A OPERATOR_CATALOG_NAMES
 declare -A OPERATOR_FBC_SOURCES
 declare -A OPERATOR_FBC_TARGETS
@@ -246,24 +447,35 @@ declare -A OPERATOR_NAMESPACES
 declare -A OPERATOR_CHANNELS
 declare -A OPERATOR_INSTALL_MODES
 
+# Unified deployment configuration
+# OPERATORS array will contain either operator names or FBC tags
+declare -a DEPLOYMENT_KEYS=()
+
 if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    # Multiple operators mode
+    # Operator mode: derive FBC tags from operator names
     for op in "${OPERATORS[@]}"; do
         fbc_tag=$(get_fbc_tag "$op" "$VERSION")
-        OPERATOR_FBC_TAGS[$op]="$fbc_tag"
+        DEPLOYMENT_KEYS+=("$op")
         OPERATOR_CATALOG_NAMES[$op]="${op}-konflux"
-        OPERATOR_FBC_SOURCES[$op]="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+        OPERATOR_FBC_SOURCES[$op]="${ART_FBC_BASE}:${fbc_tag}"
+        OPERATOR_FBC_TARGETS[$op]="${OPERATOR_FBC_SOURCES[$op]}"
         if [[ "$DISCONNECTED" == true ]]; then
             OPERATOR_FBC_TARGETS[$op]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
-        else
-            OPERATOR_FBC_TARGETS[$op]="${OPERATOR_FBC_SOURCES[$op]}"
         fi
     done
 else
-    # Single FBC tag mode
-    FBC_TAG="${FBC_TAG_INPUT}"
-    CATALOG_NAME=$(echo "$FBC_TAG" | sed 's/ocp__[^_]*__//' | sed 's/-rhel9-operator$//' | sed 's/-operator$//')-konflux
-    FBC_SOURCE_IMAGE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
+    for fbc_tag in "${FBC_TAGS[@]}"; do
+        # Use FBC tag as the deployment key
+        DEPLOYMENT_KEYS+=("$fbc_tag")
+        # Create a sanitized catalog name from the FBC tag
+        catalog_name=$(echo "$fbc_tag" | tr ':' '-' | tr '/' '-' | tr '_' '-')
+        OPERATOR_CATALOG_NAMES[$fbc_tag]="${catalog_name}-konflux"
+        OPERATOR_FBC_SOURCES[$fbc_tag]="${ART_FBC_BASE}:${fbc_tag}"
+        OPERATOR_FBC_TARGETS[$fbc_tag]="${OPERATOR_FBC_SOURCES[$fbc_tag]}"
+        if [[ "$DISCONNECTED" == true ]]; then
+            OPERATOR_FBC_TARGETS[$fbc_tag]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+        fi
+    done
 fi
 
 # Authenticate registries
@@ -404,273 +616,179 @@ fi
 # Mirror FBC images and extract metadata
 log_step "METADATA" "Extracting operator metadata from FBC"
 
-if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    log "INFO" "Processing ${#OPERATORS[@]} operator(s)"
+log "INFO" "Processing ${#DEPLOYMENT_KEYS[@]} operator(s)/FBC tag(s)"
+
+# Temporary file to collect all related images across all operators
+ALL_IMAGES_FILE=$(mktemp)
+
+for op in "${DEPLOYMENT_KEYS[@]}"; do
+    log "INFO" "Processing operator: $op"
     
-    # Temporary file to collect all related images across all operators
-    ALL_IMAGES_FILE=$(mktemp)
+    fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
+    fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
     
-    for op in "${OPERATORS[@]}"; do
-        log "INFO" "Processing operator: $op"
-        
-        fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
-        fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
-        
-        # Mirror FBC image if disconnected
-        if [[ "$DISCONNECTED" == true ]]; then
-            echo "Mirroring FBC image..."
-            mirror_output=$(oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" 2>&1)
-            mirror_status=$?
-            if [[ $mirror_status -ne 0 ]]; then
-                echo "ERROR: Failed to mirror FBC for $op" >&2
-                echo "Source: $fbc_source" >&2
-                echo "Target: $fbc_target" >&2
-                echo "Error output:" >&2
-                echo "$mirror_output" >&2
-                exit 1
-            fi
-        fi
-        
-        # Extract metadata from FBC
-        log "INFO" "Rendering FBC: $fbc_source"
-        opm_output=$(opm render "$fbc_source") || { log "ERROR" "opm render failed for $op"; exit 1; }
-        
-        log "INFO" "Finding latest bundle version..."
-        latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-        [[ -z "$latest_bundle" ]] && { log "ERROR" "No bundle found for $op"; exit 1; }
-        
-        log "INFO" "Extracting bundle data..."
-        bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-        
-        log "INFO" "Extracting operator metadata..."
-        operator_name=$(echo "$bundle_data" | jq -r '.package // empty' | head -1)
-        [[ -z "$operator_name" ]] && { log "ERROR" "Could not extract operator name for $op"; exit 1; }
-        
-        operator_namespace=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' | head -1)
-        if [[ -z "$operator_namespace" ]]; then
-            operator_namespace="openshift-${operator_name}"
-            namespace_source="derived"
-        else
-            namespace_source="annotated"
-        fi
-        
-        default_channel=$(echo "$opm_output" | jq -r 'select(.schema == "olm.package") | .defaultChannel // "stable"' | head -1)
-        [[ -z "$default_channel" ]] && default_channel="stable"
-        
-        install_mode=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.installModes[]? | select(.supported == true) | .type' | head -1)
-        [[ -z "$install_mode" ]] && install_mode="SingleNamespace"
-        
-        # Store metadata
-        OPERATOR_NAMES[$op]="$operator_name"
-        OPERATOR_BUNDLES[$op]="$latest_bundle"
-        OPERATOR_NAMESPACES[$op]="$operator_namespace"
-        OPERATOR_CHANNELS[$op]="$default_channel"
-        OPERATOR_INSTALL_MODES[$op]="$install_mode"
-        
-        # Print metadata using display_metadata function
-        {
-            echo "Operator Name:    $operator_name"
-            echo "Bundle Name:      $latest_bundle"
-            echo "Namespace:        $operator_namespace ($namespace_source)"
-            echo "Channel:          $default_channel"
-            echo "Install Mode:     $install_mode"
-            echo ""
-            echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u | nl -w2 -s'. '
-        } | display_metadata
-        
-        # Collect related images to temp file
-        echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' 2>/dev/null | grep -v '^$' >> "$ALL_IMAGES_FILE"
-    done
-    
-    # Calculate total unique images
-    total_images=$(sort -u "$ALL_IMAGES_FILE" | wc -l)
-    
-    echo ""
-    echo "============================================================"
-    echo "Total unique images across all operators: $total_images"
-    echo "============================================================"
-    
-    # Mirror all related images if disconnected
+    # Mirror FBC image if disconnected
     if [[ "$DISCONNECTED" == true ]]; then
-        # Merge quay and internal auth files for oc image mirror (pull+push)
-        MERGED_AUTH_FILE=$(mktemp)
-        jq -s '{auths: (.[0].auths + .[1].auths)}' "$QUAY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
-            { echo "ERROR: Failed to merge auth files for image mirroring" >&2; rm -f "$MERGED_AUTH_FILE" "$ALL_IMAGES_FILE"; exit 1; }
-        
-        # Sort unique images to a new file (avoids pipefail issues with process substitution)
-        SORTED_IMAGES_FILE=$(mktemp)
-        sort -u "$ALL_IMAGES_FILE" > "$SORTED_IMAGES_FILE"
-        rm -f "$ALL_IMAGES_FILE"
-        
-        echo "Mirroring related images..."
-        image_count=0
-        
-        # Read directly from the sorted file
-        set +e  # Temporarily disable exit on error for the loop
-        while IFS= read -r image; do
-            [[ -z "$image" ]] && continue
-            
-            digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}')
-            [[ -z "$digest" ]] && continue
-            
-            ((image_count++))
-            echo "  [$image_count/$total_images] Mirroring $digest..."
-            source="${ART_IMAGES_SOURCE}@${digest}"
-            target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-            
-            mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1)
-            mirror_status=$?
-            if [[ $mirror_status -eq 0 ]]; then
-                echo "    ✓ Success"
-            else
-                set -e  # Re-enable exit on error
-                echo "ERROR: Failed to mirror $digest" >&2
-                echo "Source: $source" >&2
-                echo "Target: $target" >&2
-                echo "Digest: $digest" >&2
-                echo "Error output:" >&2
-                echo "$mirror_output" >&2
-                rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
-                exit 1
-            fi
-        done < "$SORTED_IMAGES_FILE"
-        set -e  # Re-enable exit on error
-        
-        echo "Successfully mirrored all $image_count images"
-        rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
-    else
-        rm -f "$ALL_IMAGES_FILE"
-    fi
-    
-else
-    # Single FBC tag mode (original behavior)
-    log "INFO" "Processing single operator from FBC tag"
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        log "INFO" "Mirroring FBC image for disconnected cluster..."
-        fbc_target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${FBC_TAG}"
-        mirror_output=$(oc image mirror --keep-manifest-list=true "$FBC_SOURCE_IMAGE" "$fbc_target" 2>&1)
+        echo "Mirroring FBC image..."
+        mirror_output=$(oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" 2>&1)
         mirror_status=$?
         if [[ $mirror_status -ne 0 ]]; then
-            log "ERROR" "Failed to mirror FBC"
-            log "ERROR" "Source: $FBC_SOURCE_IMAGE"
-            log "ERROR" "Target: $fbc_target"
-            log "ERROR" "Error output:"
+            echo "ERROR: Failed to mirror FBC for $op" >&2
+            echo "Source: $fbc_source" >&2
+            echo "Target: $fbc_target" >&2
+            echo "Error output:" >&2
             echo "$mirror_output" >&2
             exit 1
         fi
-        log "SUCCESS" "FBC image mirrored successfully"
-    else
-        fbc_target="${FBC_SOURCE_IMAGE}"
     fi
-    
-    log "INFO" "Rendering FBC: $FBC_SOURCE_IMAGE"
-    opm_output=$(opm render "$FBC_SOURCE_IMAGE") || { log "ERROR" "opm render failed"; exit 1; }
-    
+
+    # Extract metadata from FBC
+    log "INFO" "Rendering FBC: $fbc_source"
+    opm_output=$(opm render "$fbc_source") || { log "ERROR" "opm render failed for $op"; exit 1; }
+
     log "INFO" "Finding latest bundle version..."
     latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-    [[ -z "$latest_bundle" ]] && { log "ERROR" "No bundle found"; exit 1; }
-    
+    [[ -z "$latest_bundle" ]] && { log "ERROR" "No bundle found for $op"; exit 1; }
+
     log "INFO" "Extracting bundle data..."
     bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-    
+
     log "INFO" "Extracting operator metadata..."
-    OPERATOR_NAME=$(echo "$bundle_data" | jq -r '.package // empty' | head -1)
-    [[ -z "$OPERATOR_NAME" ]] && { log "ERROR" "Could not extract operator name from bundle"; exit 1; }
-    
-    OPERATOR_NAMESPACE=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' | head -1)
-    if [[ -z "$OPERATOR_NAMESPACE" ]]; then
-        OPERATOR_NAMESPACE="openshift-${OPERATOR_NAME}"
-        NAMESPACE_SOURCE="derived from operator name"
+    operator_name=$(echo "$bundle_data" | jq -r '.package // empty' | head -1)
+    [[ -z "$operator_name" ]] && { log "ERROR" "Could not extract operator name for $op"; exit 1; }
+
+    operator_namespace=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' | head -1)
+    if [[ -z "$operator_namespace" ]]; then
+        operator_namespace="openshift-${operator_name}"
+        namespace_source="derived"
     else
-        NAMESPACE_SOURCE="from FBC annotation"
+        namespace_source="annotated"
     fi
-    
+
     default_channel=$(echo "$opm_output" | jq -r 'select(.schema == "olm.package") | .defaultChannel // "stable"' | head -1)
     [[ -z "$default_channel" ]] && default_channel="stable"
-    
+
     install_mode=$(echo "$bundle_data" | jq -r '.properties[]? | select(.type == "olm.csv.metadata") | .value.installModes[]? | select(.supported == true) | .type' | head -1)
     [[ -z "$install_mode" ]] && install_mode="SingleNamespace"
-    
+
+    # Store metadata
+    OPERATOR_NAMES[$op]="$operator_name"
+    OPERATOR_BUNDLES[$op]="$latest_bundle"
+    OPERATOR_NAMESPACES[$op]="$operator_namespace"
+    OPERATOR_CHANNELS[$op]="$default_channel"
+    OPERATOR_INSTALL_MODES[$op]="$install_mode"
+
+    # Print metadata using display_metadata function
     {
-        echo "Operator Name:    ${OPERATOR_NAME}"
-        echo "Bundle Name:      ${latest_bundle}"
-        echo "Namespace:        ${OPERATOR_NAMESPACE} (${NAMESPACE_SOURCE})"
-        echo "Channel:          ${default_channel}"
-        echo "Install Mode:     ${install_mode}"
+        echo "Operator Name:    $operator_name"
+        echo "Bundle Name:      $latest_bundle"
+        echo "Namespace:        $operator_namespace ($namespace_source)"
+        echo "Channel:          $default_channel"
+        echo "Install Mode:     $install_mode"
         echo ""
         echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u | nl -w2 -s'. '
     } | display_metadata
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        echo "Mirroring related images..."
-        image_count=0
-        total_images=$(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | wc -l)
-        
-        while IFS= read -r image; do
-            [[ -z "$image" ]] && continue
-            digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}' || continue)
-            [[ -z "$digest" ]] && continue
-            
-            ((image_count++))
-            echo "  [$image_count/$total_images] Mirroring $digest..."
-            source="${ART_IMAGES_SOURCE}@${digest}"
-            target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-            
-            mirror_output=$(oc image mirror --keep-manifest-list=true "$source" "$target" </dev/null 2>&1)
-            mirror_status=$?
-            
-            if [[ $mirror_status -eq 0 ]]; then
-                echo "$mirror_output" | tail -2
-                echo "    ✓ Success"
-            else
-                echo "ERROR: Failed to mirror image" >&2
-                echo "$mirror_output" | tail -10 >&2
-                echo "  Source: $source" >&2
-                echo "  Target: $target" >&2
-                echo "  Digest: $digest" >&2
-                exit 1
-            fi
-        done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sort -u)
-        echo "Successfully mirrored all $image_count images"
-    fi
+
+    # Collect related images to temp file
+    echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' 2>/dev/null | grep -v '^$' >> "$ALL_IMAGES_FILE"
+done
+
+# Calculate total unique images
+total_images=$(sort -u "$ALL_IMAGES_FILE" | wc -l)
+
+echo ""
+echo "============================================================"
+echo "Total unique images across all operators: $total_images"
+echo "============================================================"
+
+# Mirror all related images if disconnected
+if [[ "$DISCONNECTED" == true ]]; then
+    # Merge quay and internal auth files for oc image mirror (pull+push)
+    MERGED_AUTH_FILE=$(mktemp)
+    jq -s '{auths: (.[0].auths + .[1].auths)}' "$QUAY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
+        { echo "ERROR: Failed to merge auth files for image mirroring" >&2; rm -f "$MERGED_AUTH_FILE" "$ALL_IMAGES_FILE"; exit 1; }
+
+    # Sort unique images to a new file (avoids pipefail issues with process substitution)
+    SORTED_IMAGES_FILE=$(mktemp)
+    sort -u "$ALL_IMAGES_FILE" > "$SORTED_IMAGES_FILE"
+    rm -f "$ALL_IMAGES_FILE"
+
+    echo "Mirroring related images..."
+    image_count=0
+
+    # Read directly from the sorted file
+    set +e  # Temporarily disable exit on error for the loop
+    while IFS= read -r image; do
+        [[ -z "$image" ]] && continue
+
+        digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}')
+        [[ -z "$digest" ]] && continue
+
+        ((image_count++))
+        echo "  [$image_count/$total_images] Mirroring $digest..."
+        source="${ART_IMAGES_SOURCE}@${digest}"
+        target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+
+        mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1)
+        mirror_status=$?
+        if [[ $mirror_status -eq 0 ]]; then
+            echo "    ✓ Success"
+        else
+            set -e  # Re-enable exit on error
+            echo "ERROR: Failed to mirror $digest" >&2
+            echo "Source: $source" >&2
+            echo "Target: $target" >&2
+            echo "Digest: $digest" >&2
+            echo "Error output:" >&2
+            echo "$mirror_output" >&2
+            rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
+            exit 1
+        fi
+    done < "$SORTED_IMAGES_FILE"
+    set -e  # Re-enable exit on error
+
+    echo "Successfully mirrored all $image_count images"
+    rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
+else
+    rm -f "$ALL_IMAGES_FILE"
 fi
 
 # Create IDMS
 log_step "IDMS" "Creating Image Digest Mirror Sets (IDMS)"
 
-if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    # Create separate IDMS for each operator
-    log "INFO" "Generating IDMS for each operator"
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-        IDMS_SUFFIX="internal-idms"
-    else
-        IDMS_MIRROR="${ART_IMAGES_SOURCE}"
-        IDMS_SUFFIX="art-idms"
-    fi
-    
-    # Store IDMS YAMLs in temp files
-    declare -A OPERATOR_IDMS_FILES
-    
-    # Loop 1: Generate all IDMS YAMLs
-    for op in "${OPERATORS[@]}"; do
-        fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
-        idms_name="${op}-${IDMS_SUFFIX}"
-        
-        echo "  Generating IDMS: $idms_name"
-        
-        # Re-render FBC to get bundle data for this operator
-        opm_output=$(opm render "$fbc_source" 2>/dev/null) || { echo "ERROR: opm render failed for $op" >&2; exit 1; }
-        latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-        bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-        
-        # Create temp file for this IDMS
-        idms_file=$(mktemp)
-        OPERATOR_IDMS_FILES[$op]="$idms_file"
-        
-        {
+# Create separate IDMS for each deployment key
+log "INFO" "Generating IDMS for each operator/FBC tag"
+
+if [[ "$DISCONNECTED" == true ]]; then
+    IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+    IDMS_SUFFIX="internal-idms"
+else
+    IDMS_MIRROR="${ART_IMAGES_SOURCE}"
+    IDMS_SUFFIX="art-idms"
+fi
+
+# Store IDMS YAMLs in temp files
+declare -A OPERATOR_IDMS_FILES
+
+# Loop 1: Generate all IDMS YAMLs
+for op in "${DEPLOYMENT_KEYS[@]}"; do
+    fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
+    # Sanitize the deployment key for use in IDMS name
+    sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
+    idms_name="${sanitized_key}-${IDMS_SUFFIX}"
+
+    echo "  Generating IDMS: $idms_name"
+
+    # Re-render FBC to get bundle data for this operator
+    opm_output=$(opm render "$fbc_source" 2>/dev/null) || { echo "ERROR: opm render failed for $op" >&2; exit 1; }
+    latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
+    bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
+
+    # Create temp file for this IDMS
+    idms_file=$(mktemp)
+    OPERATOR_IDMS_FILES[$op]="$idms_file"
+
+    {
         echo "apiVersion: config.openshift.io/v1
 kind: ImageDigestMirrorSet
 metadata:
@@ -683,57 +801,26 @@ spec:
     - ${IDMS_MIRROR}
     source: $repo"
         done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sed 's/@sha256:[a-f0-9]\{64\}$//' | sort -u)
-        } > "$idms_file"
-    done
+    } > "$idms_file"
+done
     
-    # Loop 2: Apply all IDMS YAMLs to cluster
-    echo ""
-    echo "Applying all IDMS to cluster..."
-    for op in "${OPERATORS[@]}"; do
-        idms_file="${OPERATOR_IDMS_FILES[$op]}"
-        idms_name="${op}-${IDMS_SUFFIX}"
-        echo "  Applying IDMS: $idms_name"
-        oc apply -f "$idms_file" || { echo "ERROR: IDMS apply failed for $op" >&2; exit 1; }
-        rm -f "$idms_file"
-    done
-    
-    log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
-    oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
-    log "SUCCESS" "Machine Config Pool update completed"
-    
-else
-    # Single operator IDMS
-    log "INFO" "Generating IDMS for single operator"
-    
-    if [[ "$DISCONNECTED" == true ]]; then
-        IDMS_NAME=$(echo "$CATALOG_NAME" | sed 's/-konflux$//')-internal-idms
-        IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-    else
-        IDMS_NAME=$(echo "$CATALOG_NAME" | sed 's/-konflux$//')-art-idms
-        IDMS_MIRROR="${ART_IMAGES_SOURCE}"
-    fi
-    
-    {
-    echo "apiVersion: config.openshift.io/v1
-kind: ImageDigestMirrorSet
-metadata:
-  name: ${IDMS_NAME}
-spec:
-  imageDigestMirrors:"
-    while IFS= read -r repo; do
-        [[ -z "$repo" ]] && continue
-        echo "  - mirrors:
-    - ${IDMS_MIRROR}
-    source: $repo"
-    done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sed 's/@sha256:[a-f0-9]\{64\}$//' | sort -u)
-    } | oc apply -f - || { log "ERROR" "IDMS apply failed"; exit 1; }
-    
-    log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
-    oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
-    oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
-    log "SUCCESS" "Machine Config Pool update completed"
-fi
+# Loop 2: Apply all IDMS YAMLs to cluster
+echo ""
+echo "Applying all IDMS to cluster..."
+for op in "${DEPLOYMENT_KEYS[@]}"; do
+    idms_file="${OPERATOR_IDMS_FILES[$op]}"
+    # Sanitize the deployment key for use in IDMS name
+    sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
+    idms_name="${sanitized_key}-${IDMS_SUFFIX}"
+    echo "  Applying IDMS: $idms_name"
+    oc apply -f "$idms_file" || { echo "ERROR: IDMS apply failed for $op" >&2; exit 1; }
+    rm -f "$idms_file"
+done
+
+log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
+oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
+oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
+log "SUCCESS" "Machine Config Pool update completed"
 
 # Add insecure registry
 log "INFO" "Configuring cluster settings"
@@ -758,359 +845,67 @@ log "SUCCESS" "Default catalogs disabled"
 # Deploy operators
 log_step "DEPLOY" "Starting Operator Deployment"
 
-if [[ ${#OPERATORS[@]} -gt 0 ]]; then
-    # Deploy multiple operators
-    log "INFO" "Deploying ${#OPERATORS[@]} operator(s)"
-    
-    # Arrays to track deployment status
-    declare -a FAILED_OPERATORS=()
-    declare -a SUCCESS_OPERATORS=()
-    
-    for op in "${OPERATORS[@]}"; do
-        echo ""
-        echo "Deploying operator: $op"
-        echo "------------------------------------------------------------"
-        
-        catalog_name="${OPERATOR_CATALOG_NAMES[$op]}"
-        fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
-        operator_name="${OPERATOR_NAMES[$op]}"
-        operator_namespace="${OPERATOR_NAMESPACES[$op]}"
-        latest_bundle="${OPERATOR_BUNDLES[$op]}"
-        default_channel="${OPERATOR_CHANNELS[$op]}"
-        install_mode="${OPERATOR_INSTALL_MODES[$op]}"
-        
-        # Flag to track if this operator deployment failed
-        deployment_failed=false
-        
-        # Cleanup existing resources
-        log "INFO" "Cleaning up existing resources for $op..."
-        log "INFO" "  - Deleting namespace: $operator_namespace"
-        oc delete namespace "$operator_namespace" --ignore-not-found >/dev/null 2>&1 || true
-        log "INFO" "  - Deleting CatalogSource: $catalog_name"
-        oc delete catalogsource "$catalog_name" -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
-        log "SUCCESS" "Cleanup completed for $op"
-        
-        # Temporarily disable exit on error for this operator's deployment
-        set +e
-        
-        # Create CatalogSource
-        log "INFO" "Creating CatalogSource for $op..."
-        if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: CatalogSource
-metadata:
-  name: ${catalog_name}
-  namespace: openshift-marketplace
-spec:
-  displayName: ${catalog_name}
-  image: ${fbc_target}
-  sourceType: grpc
-EOF
-        then
-            log "ERROR" "CatalogSource apply failed for $op"
+# Deploy all operators/FBC tags
+log "INFO" "Deploying ${#DEPLOYMENT_KEYS[@]} operator(s)/FBC tag(s)"
+
+# Arrays to track deployment status
+declare -a FAILED_OPERATORS=()
+declare -a SUCCESS_OPERATORS=()
+
+for op in "${DEPLOYMENT_KEYS[@]}"; do
+      
+    catalog_name="${OPERATOR_CATALOG_NAMES[$op]}"
+    fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
+    operator_name="${OPERATOR_NAMES[$op]}"
+    operator_namespace="${OPERATOR_NAMESPACES[$op]}"
+    latest_bundle="${OPERATOR_BUNDLES[$op]}"
+    default_channel="${OPERATOR_CHANNELS[$op]}"
+    install_mode="${OPERATOR_INSTALL_MODES[$op]}"
+
+    # Flag to track if this operator deployment failed
+    deployment_failed=false
+
+    # Temporarily disable exit on error for this operator's deployment
+    set +e
+
+    if [[ "$KONFLUX_DEPLOY_CATALOG_SOURCE" == true ]]; then
+        # Deploy CatalogSource
+        if ! deploy_catalog_source "$catalog_name" "$fbc_target" "$op"; then
             deployment_failed=true
-        else
-            log "SUCCESS" "CatalogSource created"
         fi
-        
-        # Wait for catalog ready
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for CatalogSource to be ready..."
-            if ! oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
-                catalogsource "$catalog_name" -n openshift-marketplace --timeout=300s 2>/dev/null; then
-                log "ERROR" "CatalogSource $catalog_name not ready within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "CatalogSource is ready"
-            fi
+    fi
+
+    if [[ "$KONFLUX_DEPLOY_SUBSCRIPTION" == true && "$deployment_failed" == false ]]; then
+        # Deploy Operator
+        if ! deploy_operator "$op" "$operator_name" "$operator_namespace" "$latest_bundle" "$default_channel" "$install_mode" "$catalog_name"; then
+            deployment_failed=true
         fi
-        
-        # Create namespace
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Creating Namespace for $op..."
-            if oc apply -f - >/dev/null 2>&1 <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $operator_namespace
-  labels:
-    pod-security.kubernetes.io/enforce: privileged
-EOF
-            then
-                log "SUCCESS" "Namespace created"
-            else
-                log "ERROR" "Namespace creation failed for $op"
-                deployment_failed=true
-            fi
-        fi
-        
-        # Create OperatorGroup
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Creating OperatorGroup for $op..."
-            if [[ "$install_mode" == "AllNamespaces" ]]; then
-                if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${operator_name}
-  namespace: ${operator_namespace}
-spec: {}
-EOF
-                then
-                    log "ERROR" "OperatorGroup apply failed for $op"
-                    deployment_failed=true
-                else
-                    log "SUCCESS" "OperatorGroup created"
-                fi
-            else
-                if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${operator_name}
-  namespace: ${operator_namespace}
-spec:
-  targetNamespaces:
-  - ${operator_namespace}
-EOF
-                then
-                    log "ERROR" "OperatorGroup apply failed for $op"
-                    deployment_failed=true
-                else
-                    log "SUCCESS" "OperatorGroup created"
-                fi
-            fi
-        fi
-        
-        # Create Subscription
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Creating Subscription for $op..."
-            if ! oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: ${operator_name}
-  namespace: ${operator_namespace}
-spec:
-  channel: $default_channel
-  installPlanApproval: Automatic
-  name: ${operator_name}
-  source: $catalog_name
-  sourceNamespace: openshift-marketplace
-EOF
-            then
-                log "ERROR" "Subscription apply failed for $op"
-                deployment_failed=true
-            else
-                log "SUCCESS" "Subscription created"
-            fi
-        fi
-        
-        # Wait for subscription to get currentCSV
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for subscription to resolve..."
-            if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${operator_name}" -n "${operator_namespace}" --timeout=120s 2>/dev/null; then
-                log "ERROR" "Subscription did not resolve within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "Subscription resolved"
-            fi
-        fi
-        
-        # Wait for CSV
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-            csv_timeout=180
-            csv_elapsed=0
-            csv_created=false
-            while [[ $csv_elapsed -lt $csv_timeout ]]; do
-                if oc get csv "$latest_bundle" -n "$operator_namespace" >/dev/null 2>&1; then
-                    csv_created=true
-                    break
-                fi
-                sleep 2
-                csv_elapsed=$((csv_elapsed + 2))
-            done
-            if [[ "$csv_created" == false ]]; then
-                log "ERROR" "CSV ${latest_bundle} not created within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "CSV created"
-            fi
-        fi
-        
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
-            if ! oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$operator_namespace" --timeout=120s 2>/dev/null; then
-                log "ERROR" "CSV ${latest_bundle} did not reach Succeeded phase"
-                deployment_failed=true
-            else
-                log "SUCCESS" "CSV reached Succeeded phase"
-            fi
-        fi
-        
-        # Wait for operator pods
-        if [[ "$deployment_failed" == false ]]; then
-            log "INFO" "Waiting for operator pods to be ready..."
-            if ! oc wait --for=condition=Ready pods --all -n "$operator_namespace" --timeout=120s 2>/dev/null; then
-                log "ERROR" "Operator pods not ready within timeout"
-                deployment_failed=true
-            else
-                log "SUCCESS" "All operator pods are ready"
-            fi
-        fi
-        
-        # Re-enable exit on error
-        set -e
+    fi
+
+    # Re-enable exit on error
+    set -e
         
         # Record result
-        if [[ "$deployment_failed" == true ]]; then
-            FAILED_OPERATORS+=("$op")
-            log "ERROR" "Operator $op deployment failed, continuing with next operator..."
-        else
-            SUCCESS_OPERATORS+=("$op")
-            log "SUCCESS" "Operator $op deployed successfully"
-        fi
-    done
-    
-    log_step "SUMMARY" "Deployment Summary"
-    
-    if [[ ${#SUCCESS_OPERATORS[@]} -gt 0 ]]; then
-        log "SUCCESS" "Successfully deployed (${#SUCCESS_OPERATORS[@]}): ${SUCCESS_OPERATORS[*]}"
-    fi
-    
-    if [[ ${#FAILED_OPERATORS[@]} -gt 0 ]]; then
-        log "ERROR" "Failed to deploy (${#FAILED_OPERATORS[@]}): ${FAILED_OPERATORS[*]}"
-        log "ERROR" "Deployment completed with errors!"
-        exit 1
+    if [[ "$deployment_failed" == true ]]; then
+        FAILED_OPERATORS+=("$op")
+        log "ERROR" "Operator $op deployment failed, continuing with next operator..."
     else
-        log "SUCCESS" "All operators deployed successfully!"
+        SUCCESS_OPERATORS+=("$op")
+        log "SUCCESS" "Operator $op deployed successfully"
     fi
-    
+done
+
+log_step "SUMMARY" "Deployment Summary"
+
+if [[ ${#SUCCESS_OPERATORS[@]} -gt 0 ]]; then
+    log "SUCCESS" "Successfully deployed (${#SUCCESS_OPERATORS[@]}): ${SUCCESS_OPERATORS[*]}"
+fi
+
+if [[ ${#FAILED_OPERATORS[@]} -gt 0 ]]; then
+    log "ERROR" "Failed to deploy (${#FAILED_OPERATORS[@]}): ${FAILED_OPERATORS[*]}"
+    log "ERROR" "Deployment completed with errors!"
+    exit 1
 else
-    # Deploy single operator (original behavior)
-    log "INFO" "Deploying single operator"
-    
-    # Cleanup existing resources
-    log "INFO" "Cleaning up existing resources..."
-    log "INFO" "  - Deleting namespace: $OPERATOR_NAMESPACE"
-    oc delete namespace "$OPERATOR_NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
-    log "INFO" "  - Deleting CatalogSource: $CATALOG_NAME"
-    oc delete catalogsource "$CATALOG_NAME" -n openshift-marketplace --ignore-not-found >/dev/null 2>&1 || true
-    log "SUCCESS" "Cleanup completed"
-    
-    # Create CatalogSource
-    log "INFO" "Creating CatalogSource..."
-    oc apply -f - <<EOF || { log "ERROR" "CatalogSource apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1alpha1
-kind: CatalogSource
-metadata:
-  name: ${CATALOG_NAME}
-  namespace: openshift-marketplace
-spec:
-  displayName: ${CATALOG_NAME}
-  image: ${fbc_target}
-  sourceType: grpc
-EOF
-    log "SUCCESS" "CatalogSource created"
-    
-    # Wait for catalog ready
-    log "INFO" "Waiting for CatalogSource to be ready..."
-    oc wait --for=jsonpath='{.status.connectionState.lastObservedState}'=READY \
-        catalogsource "$CATALOG_NAME" -n openshift-marketplace --timeout=300s 2>/dev/null || true
-    log "SUCCESS" "CatalogSource is ready"
-    
-    # Create namespace
-    log "INFO" "Creating Namespace..."
-    oc apply -f - >/dev/null 2>&1 <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: $OPERATOR_NAMESPACE
-  labels:
-    pod-security.kubernetes.io/enforce: privileged
-EOF
-    log "SUCCESS" "Namespace created"
-    
-    # Create OperatorGroup
-    log "INFO" "Creating OperatorGroup..."
-    if [[ "$install_mode" == "AllNamespaces" ]]; then
-        oc apply -f - <<EOF || { log "ERROR" "OperatorGroup apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${OPERATOR_NAME}
-  namespace: ${OPERATOR_NAMESPACE}
-spec: {}
-EOF
-    log "SUCCESS" "OperatorGroup created"
-    else
-        oc apply -f - <<EOF || { log "ERROR" "OperatorGroup apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: operator-group-${OPERATOR_NAME}
-  namespace: ${OPERATOR_NAMESPACE}
-spec:
-  targetNamespaces:
-  - ${OPERATOR_NAMESPACE}
-EOF
-    log "SUCCESS" "OperatorGroup created"
-    fi
-    
-    # Create Subscription
-    log "INFO" "Creating Subscription..."
-    oc apply -f - <<EOF || { log "ERROR" "Subscription apply failed"; exit 1; }
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: ${OPERATOR_NAME}
-  namespace: ${OPERATOR_NAMESPACE}
-spec:
-  channel: $default_channel
-  installPlanApproval: Automatic
-  name: ${OPERATOR_NAME}
-  source: $CATALOG_NAME
-  sourceNamespace: openshift-marketplace
-EOF
-    log "SUCCESS" "Subscription created"
-    
-    # Wait for subscription to get currentCSV
-    log "INFO" "Waiting for subscription to resolve..."
-    if ! oc wait --for=jsonpath='{.status.currentCSV}'="${latest_bundle}" subscription "${OPERATOR_NAME}" -n "${OPERATOR_NAMESPACE}" --timeout=120s 2>/dev/null; then
-        log "ERROR" "Subscription did not resolve within timeout"
-        exit 1
-    fi
-    log "SUCCESS" "Subscription resolved"
-    
-    # Wait for CSV
-    log "INFO" "Waiting for CSV ${latest_bundle} to be created..."
-    csv_timeout=180
-    csv_elapsed=0
-    csv_created=false
-    while [[ $csv_elapsed -lt $csv_timeout ]]; do
-        if oc get csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" >/dev/null 2>&1; then
-            csv_created=true
-            break
-        fi
-        sleep 2
-        csv_elapsed=$((csv_elapsed + 2))
-    done
-    if [[ "$csv_created" == false ]]; then
-        log "WARNING" "CSV ${latest_bundle} was not created within timeout"
-    else
-        log "SUCCESS" "CSV created"
-    fi
-    
-    log "INFO" "Waiting for CSV ${latest_bundle} to reach Succeeded phase..."
-    oc wait --for=jsonpath='{.status.phase}'=Succeeded csv "$latest_bundle" -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
-        { log "WARNING" "CSV ${latest_bundle} did not reach Succeeded phase within timeout"; }
-    log "SUCCESS" "CSV reached Succeeded phase"
-    
-    # Wait for operator pods
-    log "INFO" "Waiting for operator pods to be ready..."
-    oc wait --for=condition=Ready pods --all -n "$OPERATOR_NAMESPACE" --timeout=180s 2>/dev/null || \
-        { log "WARNING" "Operator pods did not reach Ready state within timeout"; }
-    log "SUCCESS" "All operator pods are ready"
+    log "SUCCESS" "All operators deployed successfully!"
 fi
 
