@@ -263,10 +263,19 @@ jobs:
           
           # Set CRC cache directory to /mnt which has more space (66GB available)
           # This avoids "no space left on device" errors during bundle extraction
+          # CRC uses ~/.crc/cache for temporary extraction, so we need to symlink it
           export CRC_CACHE_DIR=/mnt/crc-cache
           sudo mkdir -p "$CRC_CACHE_DIR"
           sudo chown -R $USER:$USER "$CRC_CACHE_DIR"
-          echo "CRC cache directory set to: $CRC_CACHE_DIR"
+          # Create symlink from default cache location to /mnt to use larger disk
+          mkdir -p ~/.crc
+          if [ -d ~/.crc/cache ] && [ ! -L ~/.crc/cache ]; then
+            # Move existing cache if it exists
+            sudo mv ~/.crc/cache "$CRC_CACHE_DIR/old-cache" || true
+          fi
+          # Create symlink so CRC uses /mnt for cache (including tmp-extract)
+          ln -sfn "$CRC_CACHE_DIR" ~/.crc/cache
+          echo "CRC cache directory set to: $CRC_CACHE_DIR (symlinked from ~/.crc/cache)"
           df -h "$CRC_CACHE_DIR"
           
           # Setup CRC (download and extract bundle)
