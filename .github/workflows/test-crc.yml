@@ -327,6 +327,37 @@ jobs:
             }
           }
           
+          # FIX: Make CRC cache directory and VM disk image accessible to qemu
+          # libvirt runs qemu as a different user that needs read access to the disk images
+          echo "Fixing permissions for libvirt/qemu access..."
+          sudo chmod -R o+rx ~/.crc/cache/ || true
+          sudo chmod -R o+rx "$CRC_CACHE_DIR" || true
+          # Also ensure the home directory itself is traversable
+          chmod o+x ~/ || true
+          # Verify permissions
+          ls -la ~/.crc/cache/ || true
+          
+          # Disable AppArmor for libvirt-qemu if it's causing issues
+          # AppArmor can prevent qemu from accessing files outside its allowed paths
+          if [ -f /etc/apparmor.d/usr.sbin.libvirtd ]; then
+            echo "Disabling AppArmor for libvirt..."
+            sudo ln -sf /etc/apparmor.d/usr.sbin.libvirtd /etc/apparmor.d/disable/ 2>/dev/null || true
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.libvirtd 2>/dev/null || true
+          fi
+          if [ -f /etc/apparmor.d/libvirt/TEMPLATE.qemu ]; then
+            echo "Disabling AppArmor for QEMU..."
+            sudo aa-complain /etc/apparmor.d/libvirt/TEMPLATE.qemu 2>/dev/null || true
+          fi
+          # Try setting libvirt to run qemu as root to avoid permission issues
+          if [ -f /etc/libvirt/qemu.conf ]; then
+            echo "Configuring libvirt to run qemu with elevated permissions..."
+            sudo sed -i 's/#user = "root"/user = "root"/' /etc/libvirt/qemu.conf || true
+            sudo sed -i 's/#group = "root"/group = "root"/' /etc/libvirt/qemu.conf || true
+            sudo sed -i 's/user = "libvirt-qemu"/user = "root"/' /etc/libvirt/qemu.conf || true
+            sudo sed -i 's/group = "libvirt-qemu"/group = "root"/' /etc/libvirt/qemu.conf || true
+            sudo systemctl restart libvirtd || true
+          fi
+          
           # Ensure crc-admin-helper has correct permissions (SUID bit and root ownership required)
           # This must be done after crc setup creates the file
           if [ -f ~/.crc/bin/crc-admin-helper-linux-amd64 ]; then
