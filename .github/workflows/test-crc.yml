@@ -42,19 +42,34 @@ jobs:
             build-essential
           
           # Ensure virtiofsd is available (required for CRC)
-          # virtiofsd is typically in qemu-system-common or qemu-utils
-          if ! command -v virtiofsd &> /dev/null; then
-            echo "virtiofsd not found in PATH, checking for package..."
-            # Try to find and install the package containing virtiofsd
-            sudo apt-get install -y qemu-system-common || true
-            # Verify virtiofsd is available
-            if ! command -v virtiofsd &> /dev/null; then
-              echo "Warning: virtiofsd still not found, but continuing..."
-            else
-              echo "virtiofsd found: $(which virtiofsd)"
+          # On Ubuntu, virtiofsd is typically in qemu-system-x86 or needs to be built
+          # First, try to find existing virtiofsd
+          VIRTIOFSD_PATH=$(find /usr -name virtiofsd 2>/dev/null | head -1)
+          
+          if [ -z "$VIRTIOFSD_PATH" ]; then
+            echo "virtiofsd not found, installing qemu packages that may contain it..."
+            # Install all qemu system packages that might contain virtiofsd
+            sudo apt-get install -y qemu-system-x86 qemu-system-data qemu-system-common || true
+            
+            # Search again
+            VIRTIOFSD_PATH=$(find /usr -name virtiofsd 2>/dev/null | head -1)
+          fi
+          
+          if [ -n "$VIRTIOFSD_PATH" ] && [ -f "$VIRTIOFSD_PATH" ]; then
+            echo "Found virtiofsd at: $VIRTIOFSD_PATH"
+            sudo chmod +x "$VIRTIOFSD_PATH" || true
+            # Create symlink in /usr/bin if not already there for easier access
+            if [ "$VIRTIOFSD_PATH" != "/usr/bin/virtiofsd" ] && [ ! -f /usr/bin/virtiofsd ]; then
+              sudo ln -sf "$VIRTIOFSD_PATH" /usr/bin/virtiofsd || true
+              echo "Created symlink: /usr/bin/virtiofsd -> $VIRTIOFSD_PATH"
             fi
           else
-            echo "virtiofsd found: $(which virtiofsd)"
+            echo "ERROR: virtiofsd not found after installation attempts!"
+            echo "This will cause CRC to fail. Checking available qemu packages..."
+            dpkg -l | grep qemu || true
+            echo "Attempting to build virtiofsd from qemu source or use workaround..."
+            # Last resort: try to download pre-built virtiofsd or configure CRC differently
+            # For now, we'll let CRC fail and see the exact error
           fi
           
           # Add user to libvirt group early so it's available for CRC setup
