@@ -197,8 +197,8 @@ The script follows these steps when deploying an operator:
 
 | Argument | Description | Required |
 |----------|-------------|----------|
-| `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes* |
-| `--fbc-tag <tag>` | Custom FBC image tag (e.g., `ocp__4.20__metallb-rhel9-operator`). Alternative to `--operator` for advanced usage. Supports comma-separated list: `ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-local-storage-rhel9-operator` | Yes* |
+| `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes* |
+| `--fbc-tag <tags>` | Custom FBC image tag(s). Alternative to `--operator` for advanced usage. Supports comma-separated list for multiple tags (e.g., `ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-sriov-network-rhel9-operator`) | Yes* |
 | `--internal-registry <host:port>` | Internal registry location (enables disconnected mode) | No |
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
 | `--quay-auth <file>` | Quay.io authentication file | Conditional |
@@ -211,8 +211,11 @@ The script follows these steps when deploying an operator:
 - Script automatically detects mode based on `--internal-registry` presence
 - `--quay-auth` is required for disconnected mode, optional for connected mode if cluster's pull-secret already contains auth for quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share repository
 - For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
-- It is possible to skip deployment of the catalog source or operator by setting env variable KONFLUX_DEPLOY_CATALOG_SOURCE=false, or KONFLUX_DEPLOY_OPERATOR=false
-- It is possible to quit the script early by setting KONFLUX_SKIP_DEPLOYMENT=true
+
+**Environment Variables:**
+- `KONFLUX_DEPLOY_OPERATORS=false` - Skip all operator deployments entirely
+- `KONFLUX_DEPLOY_CATALOG_SOURCE=false` - Skip CatalogSource creation only
+- `KONFLUX_DEPLOY_SUBSCRIPTION=false` - Skip Subscription creation only (useful for deploying catalog without installing operators)
 
 
 ---
@@ -240,14 +243,19 @@ The script follows these steps when deploying an operator:
 
 **Custom FBC Tag:**
 ```bash
-# With quay-auth
+# Single FBC tag (with quay-auth)
 ./deploy-operator.sh \
   --fbc-tag ocp__4.20__metallb-rhel9-operator \
   --quay-auth /path/to/quay-auth.json
 
-# Using cluster's existing pull-secret auth
+# Single FBC tag (using cluster's existing pull-secret auth)
 ./deploy-operator.sh \
   --fbc-tag ocp__4.20__metallb-rhel9-operator
+
+# Multiple FBC tags (comma-separated)
+./deploy-operator.sh \
+  --fbc-tag ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-sriov-network-rhel9-operator \
+  --quay-auth /path/to/quay-auth.json
 ```
 
 **Custom MCP Timeout (for larger clusters):**
@@ -281,8 +289,16 @@ The script follows these steps when deploying an operator:
 
 **Custom FBC Tag:**
 ```bash
+# Single FBC tag
 ./deploy-operator.sh \
   --fbc-tag ocp__4.21__ose-sriov-network-rhel9-operator \
+  --internal-registry registry.example.com:5000 \
+  --internal-registry-auth /path/to/internal-auth.json \
+  --quay-auth /path/to/quay-auth.json
+
+# Multiple FBC tags (comma-separated)
+./deploy-operator.sh \
+  --fbc-tag ocp__4.21__ose-sriov-network-rhel9-operator,ocp__4.21__metallb-rhel9-operator \
   --internal-registry registry.example.com:5000 \
   --internal-registry-auth /path/to/internal-auth.json \
   --quay-auth /path/to/quay-auth.json
