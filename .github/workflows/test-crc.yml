@@ -311,9 +311,15 @@ jobs:
         env:
           CRC_PULL_SECRET: ${{ secrets.CRC_PULL_SECRET }}
         run: |
+          # CRC requires a pull secret to start - fail early if not provided
           if [ -z "$CRC_PULL_SECRET" ]; then
-            echo "Warning: CRC_PULL_SECRET not set. CRC may fail to start."
-            echo "Please add your pull secret to GitHub secrets."
+            echo "ERROR: CRC_PULL_SECRET is required but not set."
+            echo "CRC cannot start without a pull secret in non-interactive environments."
+            echo "Please add your pull secret to GitHub secrets:"
+            echo "  1. Go to https://github.com/${{ github.repository }}/settings/secrets/actions"
+            echo "  2. Add a new secret named 'CRC_PULL_SECRET'"
+            echo "  3. Paste your pull secret from https://console.redhat.com/openshift/create/local"
+            exit 1
           fi
           
           # Set CRC cache directory to /mnt which has more space (66GB available)
@@ -377,45 +383,25 @@ jobs:
           # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
           # Note: sg libvirt requires the user to be in the libvirt group (already done in Install dependencies step)
           # Use CRC_CACHE_DIR to ensure we use the cache directory with more space
+          # CRC_PULL_SECRET is required (checked above), so we always use it
           CRC_START_SUCCESS=false
-          if [ -n "$CRC_PULL_SECRET" ]; then
-            echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
-              echo "Warning: sg failed, trying runuser..."
-              echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
-                echo "Warning: runuser failed, trying direct crc start with sg..."
-                # Last resort: try direct with sg (may fail on group check but worth trying)
-                echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
-                  echo "ERROR: All attempts to start CRC failed!"
-                  echo "Checking CRC status..."
-                  crc status || true
-                  echo "Checking disk space..."
-                  df -h
-                  echo "Checking CRC cache directory space..."
-                  df -h "$CRC_CACHE_DIR" || true
-                  exit 1
-                }
+          echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+            echo "Warning: sg failed, trying runuser..."
+            echo "$CRC_PULL_SECRET" | sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+              echo "Warning: runuser failed, trying direct crc start with sg..."
+              # Last resort: try direct with sg (may fail on group check but worth trying)
+              echo "$CRC_PULL_SECRET" | sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start --pull-secret-file /dev/stdin -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
+                echo "ERROR: All attempts to start CRC failed!"
+                echo "Checking CRC status..."
+                crc status || true
+                echo "Checking disk space..."
+                df -h
+                echo "Checking CRC cache directory space..."
+                df -h "$CRC_CACHE_DIR" || true
+                exit 1
               }
             }
-          else
-            # Try to start without pull secret using sg libvirt
-            sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start" && CRC_START_SUCCESS=true || {
-              echo "Warning: sg failed, trying runuser..."
-              sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start" && CRC_START_SUCCESS=true || {
-                echo "Warning: runuser failed, trying direct crc start with sg..."
-                # Last resort: try direct with sg (may fail on group check but worth trying)
-                sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start" && CRC_START_SUCCESS=true || {
-                  echo "ERROR: All attempts to start CRC failed!"
-                  echo "Checking CRC status..."
-                  crc status || true
-                  echo "Checking disk space..."
-                  df -h
-                  echo "Checking CRC cache directory space..."
-                  df -h "$CRC_CACHE_DIR" || true
-                  exit 1
-                }
-              }
-            }
-          fi
+          }
           
           if [ "$CRC_START_SUCCESS" = "true" ]; then
             echo "CRC started successfully!"
