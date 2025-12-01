@@ -656,7 +656,10 @@ jobs:
           # Test 2: Skip operator deployment (CatalogSource only)
           echo "=== Test 2: KONFLUX_DEPLOY_OPERATOR=false ==="
           if [ -n "$QUAY_AUTH" ]; then
-            KONFLUX_DEPLOY_OPERATOR=false ./deploy-operator.sh --operator sriov --quay-auth <(echo "$QUAY_AUTH") || echo "Test completed"
+            QUAY_AUTH_FILE=$(mktemp)
+            trap 'rm -f "$QUAY_AUTH_FILE"' EXIT
+            printf '%s' "$QUAY_AUTH" > "$QUAY_AUTH_FILE"
+            KONFLUX_DEPLOY_OPERATOR=false ./deploy-operator.sh --operator sriov --quay-auth "$QUAY_AUTH_FILE" || echo "Test completed"
           else
             echo "Skipping test - QUAY_AUTH not set"
           fi
@@ -751,8 +754,11 @@ jobs:
           
           # Test KONFLUX_DEPLOY_CATALOG_SOURCE=false and KONFLUX_DEPLOY_OPERATOR=false
           if [ -n "$QUAY_AUTH" ]; then
+            QUAY_AUTH_FILE=$(mktemp)
+            trap 'rm -f "$QUAY_AUTH_FILE"' EXIT
+            printf '%s' "$QUAY_AUTH" > "$QUAY_AUTH_FILE"
             KONFLUX_DEPLOY_CATALOG_SOURCE=false KONFLUX_DEPLOY_OPERATOR=false \
-              ./deploy-operator.sh --operator sriov --quay-auth <(echo "$QUAY_AUTH") 2>&1 | head -20 || echo "Environment variable test completed"
+              ./deploy-operator.sh --operator sriov --quay-auth "$QUAY_AUTH_FILE" 2>&1 | head -20 || echo "Environment variable test completed"
           else
             echo "Skipping test - QUAY_AUTH not set"
           fi
