@@ -491,11 +491,25 @@ jobs:
             # Configure oc environment
             eval $(crc oc-env)
             
-            # Login as admin
-            oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify || {
-              echo "ERROR: Failed to login to cluster"
+            # Login as admin with up to 5 retries to work around CRC race conditions
+            echo "Logging into cluster as kubeadmin (will retry on transient errors)..."
+            LOGIN_MAX_RETRIES=5
+            LOGIN_SLEEP=15
+            LOGIN_SUCCESS=false
+            LOGIN_PASSWORD=$(crc console --credentials | grep -oP 'password: \K.*')
+            for attempt in $(seq 1 $LOGIN_MAX_RETRIES); do
+              echo "Attempt $attempt/$LOGIN_MAX_RETRIES"
+              if oc login -u kubeadmin -p "$LOGIN_PASSWORD" https://api.crc.testing:6443 --insecure-skip-tls-verify; then
+                LOGIN_SUCCESS=true
+                break
+              fi
+              echo "Login failed, retrying in ${LOGIN_SLEEP}s..."
+              sleep $LOGIN_SLEEP
+            done
+            if [ "$LOGIN_SUCCESS" != "true" ]; then
+              echo "ERROR: Failed to login to cluster after $LOGIN_MAX_RETRIES attempts"
               exit 1
-            }
+            fi
             
             # Wait for cluster operators to be ready
             echo "Waiting for cluster operators to be ready..."
