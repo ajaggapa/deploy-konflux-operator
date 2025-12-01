@@ -6,6 +6,7 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Procedure](#procedure)
+- [Dry-Run Planning](#dry-run-planning)
 - [Arguments](#arguments)
 - [Usage](#usage)
 
@@ -190,6 +191,42 @@ The script follows these steps when deploying an operator:
 12. **Create Subscription** - Initiates operator installation
 13. **Wait for CSV** - Waits for ClusterServiceVersion to be created
 14. **Wait for operator pods** - Waits for all operator pods to be ready
+
+---
+
+## Dry-Run Planning
+
+Use `deployment-dry-run.sh` when you want to validate the entire workflow without touching a cluster. The script reproduces the Procedure above step-by-step and prints:
+
+- Every command you would run locally (`podman login`, `oc image mirror`, `oc wait`, etc.)
+- All YAML manifests (IDMS, CatalogSource, Namespace, OperatorGroup, Subscription) wrapped in copy/paste friendly `oc apply -f -` snippets
+- Clear stage markers (`Step 1 … Step 14`) so you can follow along with the Procedure section while executing manually
+
+Because it never mutates a cluster, the dry-run script only needs minimal inputs:
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `--operator <name>` | Same operator list as the deployment script. Supports comma-separated values. | Yes* |
+| `--fbc-tag <tags>` | Custom FBC tag(s); mutually exclusive with `--operator`. | Yes* |
+| `--internal-registry <host:port>` | When provided, the dry-run treats the scenario as disconnected and prints the mirror commands/patches for that registry. | No |
+
+Notes:
+- Provide either `--operator` or `--fbc-tag`.
+- No auth file flags are needed; the output simply references placeholder paths so you can substitute your own secrets.
+
+### Dry-run Examples
+
+```bash
+# Connected cluster dry run for sriov operator
+./deployment-dry-run.sh --operator sriov
+
+# Disconnected dry run for sriov + metallb using a custom registry
+./deployment-dry-run.sh \
+  --operator sriov,metallb \
+  --internal-registry registry.example.com:5000
+```
+
+Review the generated steps from top to bottom; once satisfied, rerun the same inputs with `deploy-operator.sh` to apply the changes for real.
 
 ---
 
