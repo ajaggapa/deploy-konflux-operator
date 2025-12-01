@@ -452,30 +452,60 @@ jobs:
           echo "$CRC_PULL_SECRET" > ~/.crc/pull-secret.txt
           chmod 600 ~/.crc/pull-secret.txt
           
-          # Start CRC with pull secret using sg libvirt (non-interactive, user is in group)
-          # Note: sg libvirt requires the user to be in the libvirt group (already done in Install dependencies step)
-          # Use CRC_CACHE_DIR to ensure we use the cache directory with more space
-          # CRC will automatically use ~/.crc/pull-secret.txt if it exists
-          CRC_START_SUCCESS=false
-          sg libvirt -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
-            echo "Warning: sg failed, trying runuser..."
-            sudo runuser -u $USER -g libvirt -- sh -c "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start -p ~/.crc/pull-secret.txt" && CRC_START_SUCCESS=true || {
-              echo "Warning: runuser failed, trying direct crc start..."
-              # Last resort: try direct (may fail on group check but worth trying)
-              CRC_CACHE_DIR=$CRC_CACHE_DIR crc start -p ~/.crc/pull-secret.txt && CRC_START_SUCCESS=true || {
-                echo "ERROR: All attempts to start CRC failed!"
-                echo "Checking CRC status..."
-                crc status || true
-                echo "Checking disk space..."
-                df -h
-                echo "Checking CRC cache directory space..."
-                df -h "$CRC_CACHE_DIR" || true
-                echo "Checking if pull secret file exists..."
-                ls -la ~/.crc/pull-secret.txt || true
-                exit 1
-              }
-            }
-          }
+          # Helper functions to ensure every CRC command runs inside the libvirt group context.
+          cat <<'EOF' >/tmp/crc-libvirt-utils.sh
+run_crc_cmd() {
+  local cmd="$*"
+  if sg libvirt -c "$cmd"; then
+    return 0
+  fi
+  if sudo runuser -u $USER -g libvirt -- bash -c "$cmd"; then
+    return 0
+  fi
+  CRC_SKIP_CHECK_LIBVIRT_GROUP=true bash -c "$cmd"
+}
+
+run_crc_cmd_capture() {
+  local cmd="$*"
+  local output
+  if output=$(sg libvirt -c "$cmd"); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  if output=$(sudo runuser -u $USER -g libvirt -- bash -c "$cmd"); then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  output=$(CRC_SKIP_CHECK_LIBVIRT_GROUP=true bash -c "$cmd")
+  local status=$?
+  printf '%s\n' "$output"
+  return $status
+}
+EOF
+          echo "CRC_LIBVIRT_HELPER=/tmp/crc-libvirt-utils.sh" >> "$GITHUB_ENV"
+          # shellcheck disable=SC1090
+          source /tmp/crc-libvirt-utils.sh
+
+          # Start CRC with pull secret using libvirt group context helper
+          echo "Starting CRC cluster (with libvirt group helper)..."
+          if run_crc_cmd "CRC_CACHE_DIR=$CRC_CACHE_DIR crc start -p ~/.crc/pull-secret.txt"; then
+            CRC_START_SUCCESS=true
+          else
+            CRC_START_SUCCESS=false
+          fi
+          
+          if [ "$CRC_START_SUCCESS" != "true" ]; then
+            echo "ERROR: All attempts to start CRC failed!"
+            echo "Checking CRC status..."
+            run_crc_cmd "crc status" || true
+            echo "Checking disk space..."
+            df -h
+            echo "Checking CRC cache directory space..."
+            df -h "$CRC_CACHE_DIR" || true
+            echo "Checking if pull secret file exists..."
+            ls -la ~/.crc/pull-secret.txt || true
+            exit 1
+          fi
           
           if [ "$CRC_START_SUCCESS" = "true" ]; then
             echo "CRC started successfully!"
@@ -489,14 +519,14 @@ jobs:
             }
             
             # Configure oc environment
-            eval $(crc oc-env)
+            eval "$(run_crc_cmd_capture 'crc oc-env')"
             
             # Login as admin with up to 5 retries to work around CRC race conditions
             echo "Logging into cluster as kubeadmin (will retry on transient errors)..."
             LOGIN_MAX_RETRIES=5
             LOGIN_SLEEP=15
             LOGIN_SUCCESS=false
-            LOGIN_PASSWORD=$(crc console --credentials | grep -oP 'password: \K.*')
+            LOGIN_PASSWORD=$(run_crc_cmd_capture 'crc console --credentials' | grep -oP 'password: \K.*')
             for attempt in $(seq 1 $LOGIN_MAX_RETRIES); do
               echo "Attempt $attempt/$LOGIN_MAX_RETRIES"
               if oc login -u kubeadmin -p "$LOGIN_PASSWORD" https://api.crc.testing:6443 --insecure-skip-tls-verify; then
@@ -521,18 +551,35 @@ jobs:
 
       - name: Verify cluster access
         run: |
+          load_crc_helpers() {
+            if [ -n "$CRC_LIBVIRT_HELPER" ] && [ -f "$CRC_LIBVIRT_HELPER" ]; then
+              # shellcheck disable=SC1090
+              source "$CRC_LIBVIRT_HELPER"
+            else
+              run_crc_cmd() { bash -c "$*"; }
+              run_crc_cmd_capture() {
+                local output
+                output=$(bash -c "$*")
+                local status=$?
+                printf '%s\n' "$output"
+                return $status
+              }
+            fi
+          }
+          load_crc_helpers
+
           # Check if CRC is running
-          if ! crc status &>/dev/null; then
+          if ! run_crc_cmd "crc status" &>/dev/null; then
             echo "ERROR: CRC cluster is not running!"
-            crc status || true
+            run_crc_cmd "crc status" || true
             exit 1
           fi
           
           # Configure oc environment
-          eval $(crc oc-env)
+          eval "$(run_crc_cmd_capture 'crc oc-env')"
           
           # Login as admin
-          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify || {
+          oc login -u kubeadmin -p "$(run_crc_cmd_capture 'crc console --credentials' | grep -oP 'password: \K.*')" https://api.crc.testing:6443 --insecure-skip-tls-verify || {
             echo "ERROR: Failed to login to cluster"
             exit 1
           }
@@ -562,8 +609,25 @@ jobs:
         env:
           QUAY_AUTH: ${{ secrets.QUAY_AUTH }}
         run: |
-          eval $(crc oc-env)
-          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          load_crc_helpers() {
+            if [ -n "$CRC_LIBVIRT_HELPER" ] && [ -f "$CRC_LIBVIRT_HELPER" ]; then
+              # shellcheck disable=SC1090
+              source "$CRC_LIBVIRT_HELPER"
+            else
+              run_crc_cmd() { bash -c "$*"; }
+              run_crc_cmd_capture() {
+                local output
+                output=$(bash -c "$*")
+                local status=$?
+                printf '%s\n' "$output"
+                return $status
+              }
+            fi
+          }
+          load_crc_helpers
+
+          eval "$(run_crc_cmd_capture 'crc oc-env')"
+          oc login -u kubeadmin -p "$(run_crc_cmd_capture 'crc console --credentials' | grep -oP 'password: \K.*')" https://api.crc.testing:6443 --insecure-skip-tls-verify
           
           # Test 1: Skip deployment (metadata extraction only)
           echo "=== Test 1: KONFLUX_SKIP_DEPLOYMENT=true ==="
@@ -598,8 +662,25 @@ jobs:
 
       - name: Test with KONFLUX_SKIP_DEPLOYMENT
         run: |
-          eval $(crc oc-env)
-          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          load_crc_helpers() {
+            if [ -n "$CRC_LIBVIRT_HELPER" ] && [ -f "$CRC_LIBVIRT_HELPER" ]; then
+              # shellcheck disable=SC1090
+              source "$CRC_LIBVIRT_HELPER"
+            else
+              run_crc_cmd() { bash -c "$*"; }
+              run_crc_cmd_capture() {
+                local output
+                output=$(bash -c "$*")
+                local status=$?
+                printf '%s\n' "$output"
+                return $status
+              }
+            fi
+          }
+          load_crc_helpers
+
+          eval "$(run_crc_cmd_capture 'crc oc-env')"
+          oc login -u kubeadmin -p "$(run_crc_cmd_capture 'crc console --credentials' | grep -oP 'password: \K.*')" https://api.crc.testing:6443 --insecure-skip-tls-verify
           
           echo "=== Testing KONFLUX_SKIP_DEPLOYMENT ==="
           KONFLUX_SKIP_DEPLOYMENT=true ./deploy-operator.sh --operator sriov 2>&1 | grep -q "Skipping deployment" && echo "✓ Correctly skips deployment" || echo "✗ Failed to skip deployment"
@@ -608,8 +689,25 @@ jobs:
         env:
           QUAY_AUTH: ${{ secrets.QUAY_AUTH }}
         run: |
-          eval $(crc oc-env)
-          oc login -u kubeadmin -p $(crc console --credentials | grep -oP 'password: \K.*') https://api.crc.testing:6443 --insecure-skip-tls-verify
+          load_crc_helpers() {
+            if [ -n "$CRC_LIBVIRT_HELPER" ] && [ -f "$CRC_LIBVIRT_HELPER" ]; then
+              # shellcheck disable=SC1090
+              source "$CRC_LIBVIRT_HELPER"
+            else
+              run_crc_cmd() { bash -c "$*"; }
+              run_crc_cmd_capture() {
+                local output
+                output=$(bash -c "$*")
+                local status=$?
+                printf '%s\n' "$output"
+                return $status
+              }
+            fi
+          }
+          load_crc_helpers
+
+          eval "$(run_crc_cmd_capture 'crc oc-env')"
+          oc login -u kubeadmin -p "$(run_crc_cmd_capture 'crc console --credentials' | grep -oP 'password: \K.*')" https://api.crc.testing:6443 --insecure-skip-tls-verify
           
           echo "=== Testing environment variable controls ==="
           
@@ -624,16 +722,50 @@ jobs:
       - name: Cleanup CRC (if needed)
         if: always()
         run: |
+          load_crc_helpers() {
+            if [ -n "$CRC_LIBVIRT_HELPER" ] && [ -f "$CRC_LIBVIRT_HELPER" ]; then
+              # shellcheck disable=SC1090
+              source "$CRC_LIBVIRT_HELPER"
+            else
+              run_crc_cmd() { bash -c "$*"; }
+              run_crc_cmd_capture() {
+                local output
+                output=$(bash -c "$*")
+                local status=$?
+                printf '%s\n' "$output"
+                return $status
+              }
+            fi
+          }
+          load_crc_helpers
+
           # Stop CRC to free resources
-          crc stop || true
-          crc delete -f || true
+          run_crc_cmd "crc stop" || true
+          run_crc_cmd "crc delete -f" || true
 
       - name: Archive logs
         if: failure()
         run: |
-          eval $(crc oc-env) || true
+          load_crc_helpers() {
+            if [ -n "$CRC_LIBVIRT_HELPER" ] && [ -f "$CRC_LIBVIRT_HELPER" ]; then
+              # shellcheck disable=SC1090
+              source "$CRC_LIBVIRT_HELPER"
+            else
+              run_crc_cmd() { bash -c "$*"; }
+              run_crc_cmd_capture() {
+                local output
+                output=$(bash -c "$*")
+                local status=$?
+                printf '%s\n' "$output"
+                return $status
+              }
+            fi
+          }
+          load_crc_helpers
+
+          eval "$(run_crc_cmd_capture 'crc oc-env')" || true
           mkdir -p /tmp/crc-logs
-          crc logs --bundle /tmp/crc-logs/crc-logs.tar.gz || true
+          run_crc_cmd "crc logs --bundle /tmp/crc-logs/crc-logs.tar.gz" || true
           # Upload logs as artifact (optional)
           echo "CRC logs saved to /tmp/crc-logs/"
 
