@@ -585,13 +585,6 @@ jobs:
           export PATH="$CRC_OC_BIN:$PATH"
           export KUBECONFIG="$CRC_KUBECONFIG_PATH"
 
-          # Check if CRC is running
-          if ! run_crc_cmd "crc status" &>/dev/null; then
-            echo "ERROR: CRC cluster is not running!"
-            run_crc_cmd "crc status" || true
-            exit 1
-          fi
-
           # Login as admin
           if [ ! -f "$CRC_KUBEADMIN_PASSWORD_FILE" ]; then
             echo "ERROR: kubeadmin password file not found at $CRC_KUBEADMIN_PASSWORD_FILE"
