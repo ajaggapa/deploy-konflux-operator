@@ -453,35 +453,35 @@ jobs:
           chmod 600 ~/.crc/pull-secret.txt
           
           # Helper functions to ensure every CRC command runs inside the libvirt group context.
-          cat <<'EOF' >/tmp/crc-libvirt-utils.sh
-run_crc_cmd() {
-  local cmd="$*"
-  if sg libvirt -c "$cmd"; then
-    return 0
-  fi
-  if sudo runuser -u $USER -g libvirt -- bash -c "$cmd"; then
-    return 0
-  fi
-  CRC_SKIP_CHECK_LIBVIRT_GROUP=true bash -c "$cmd"
-}
-
-run_crc_cmd_capture() {
-  local cmd="$*"
-  local output
-  if output=$(sg libvirt -c "$cmd"); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  if output=$(sudo runuser -u $USER -g libvirt -- bash -c "$cmd"); then
-    printf '%s\n' "$output"
-    return 0
-  fi
-  output=$(CRC_SKIP_CHECK_LIBVIRT_GROUP=true bash -c "$cmd")
-  local status=$?
-  printf '%s\n' "$output"
-  return $status
-}
-EOF
+          {
+            printf '%s\n' 'run_crc_cmd() {'
+            printf '%s\n' '  local cmd="$*"'
+            printf '%s\n' '  if sg libvirt -c "$cmd"; then'
+            printf '%s\n' '    return 0'
+            printf '%s\n' '  fi'
+            printf '%s\n' '  if sudo runuser -u $USER -g libvirt -- bash -c "$cmd"; then'
+            printf '%s\n' '    return 0'
+            printf '%s\n' '  fi'
+            printf '%s\n' '  CRC_SKIP_CHECK_LIBVIRT_GROUP=true bash -c "$cmd"'
+            printf '%s\n' '}'
+            printf '\n'
+            printf '%s\n' 'run_crc_cmd_capture() {'
+            printf '%s\n' '  local cmd="$*"'
+            printf '%s\n' '  local output'
+            printf '%s\n' '  if output=$(sg libvirt -c "$cmd"); then'
+            printf "%s\n" "    printf '%s\\n' \"\$output\""
+            printf '%s\n' '    return 0'
+            printf '%s\n' '  fi'
+            printf '%s\n' '  if output=$(sudo runuser -u $USER -g libvirt -- bash -c "$cmd"); then'
+            printf "%s\n" "    printf '%s\\n' \"\$output\""
+            printf '%s\n' '    return 0'
+            printf '%s\n' '  fi'
+            printf '%s\n' '  output=$(CRC_SKIP_CHECK_LIBVIRT_GROUP=true bash -c "$cmd")'
+            printf '%s\n' '  local status=$?'
+            printf "%s\n" "  printf '%s\\n' \"\$output\""
+            printf '%s\n' '  return $status'
+            printf '%s\n' '}'
+          } >/tmp/crc-libvirt-utils.sh
           echo "CRC_LIBVIRT_HELPER=/tmp/crc-libvirt-utils.sh" >> "$GITHUB_ENV"
           # shellcheck disable=SC1090
           source /tmp/crc-libvirt-utils.sh
