@@ -2,13 +2,7 @@ name: Syntax Check
 
 on:
   push:
-    branches:
-      - main
-      - testworkflow
   pull_request:
-    branches:
-      - main
-      - testworkflow
   workflow_dispatch:
     inputs:
       pr_number:
@@ -20,6 +14,9 @@ jobs:
   syntax-check:
     name: Check Shell Script Syntax
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
