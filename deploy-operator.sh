@@ -108,10 +108,20 @@ while [[ $# -gt 0 ]]; do
             log "INFO" "Internal registry specified: $2"
             shift 2 
             ;;
-        --internal-registry-auth) 
+        --internal-registry-auth)
             INTERNAL_REGISTRY_AUTH="$2"
             log "INFO" "Internal registry auth file specified: $2"
-            shift 2 
+            shift 2
+            ;;
+        --internal-registry-proxy)
+            INTERNAL_REGISTRY_PROXY="$2"
+            log "INFO" "Internal registry proxy specified: $2"
+            shift 2
+            ;;
+        --internal-registry-proxy-auth)
+            INTERNAL_REGISTRY_PROXY_AUTH="$2"
+            log "INFO" "Internal registry proxy auth file specified: $2"
+            shift 2
             ;;
         --quay-auth) 
             QUAY_AUTH="$2"
@@ -170,7 +180,7 @@ log_step "CONFIG" "Determining cluster mode and validating requirements"
 
 # Check if quay-auth is required for disconnected clusters
 if [[ -n "${INTERNAL_REGISTRY:-}" && -z "${QUAY_AUTH:-}" ]]; then
-    log "ERROR" "--quay-auth is required for disconnected clusters"
+    log "ERROR" "--quay-auth is required for disconnected clusters with internal registry"
     exit 1
 fi
 
@@ -179,12 +189,31 @@ if [[ -n "${INTERNAL_REGISTRY:-}" && -z "${INTERNAL_REGISTRY_AUTH:-}" ]] || [[ -
     exit 1
 fi
 
-if [[ -n "${INTERNAL_REGISTRY:-}" ]]; then
+if [[ -n "${INTERNAL_REGISTRY_PROXY:-}" && -z "${INTERNAL_REGISTRY_PROXY_AUTH:-}" ]] || [[ -z "${INTERNAL_REGISTRY_PROXY:-}" && -n "${INTERNAL_REGISTRY_PROXY_AUTH:-}" ]]; then
+    log "ERROR" "Both --internal-registry-proxy and --internal-registry-proxy-auth must be provided together"
+    exit 1
+fi
+
+if [[ -n "${INTERNAL_REGISTRY:-}" && -n "${INTERNAL_REGISTRY_PROXY:-}" ]]; then
+    log "ERROR" "Both --internal-registry and --internal-registry-proxy cannot be provided together"
+    exit 1
+fi
+
+if [[ -n "${INTERNAL_REGISTRY:-}" || -n "${INTERNAL_REGISTRY_PROXY:-}" ]]; then
     DISCONNECTED=true
-    log "INFO" "Operating in disconnected cluster mode"
+    log "INFO" "Operating in disconnected cluster mode as either --internal-registry or --internal-registry-proxy is provided"
 else
     DISCONNECTED=false
     log "INFO" "Operating in connected cluster mode"
+fi
+
+# Determine if we should use proxy registry
+if [[ -n "${INTERNAL_REGISTRY_PROXY:-}" ]]; then
+    USE_REGISTRY_PROXY=true
+    log "INFO" "Using proxy registry - images will not be mirrored"
+else
+    USE_REGISTRY_PROXY=false
+    log "INFO" "Using internal registry with image mirroring enabled"
 fi
 
 log "INFO" "Checking required tools"
@@ -195,8 +224,8 @@ for cmd in oc opm jq; do
     command -v "$cmd" >/dev/null 2>&1 || { log "ERROR" "$cmd not installed"; exit 1; }
 done
 
-# Check podman (required for disconnected clusters or when quay-auth is provided)
-if [[ "$DISCONNECTED" == true ]] || [[ -n "${QUAY_AUTH:-}" ]]; then
+# Check podman (required for disconnected clusters with internal registry or when quay-auth is provided)
+if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]] || [[ -n "${QUAY_AUTH:-}" ]]; then
     log "INFO" "Checking for podman (required for registry authentication)..."
     command -v "podman" >/dev/null 2>&1 || { log "ERROR" "podman not installed (required for registry authentication)"; exit 1; }
     log "SUCCESS" "podman is available"
@@ -218,11 +247,18 @@ else
     log "INFO" "No quay auth file provided"
 fi
 
-if [[ "$DISCONNECTED" == true ]]; then
+if [[ -n "${INTERNAL_REGISTRY_AUTH:-}" ]]; then
     log "INFO" "Validating internal registry auth file: $INTERNAL_REGISTRY_AUTH"
     [[ ! -f "$INTERNAL_REGISTRY_AUTH" ]] && { log "ERROR" "Internal registry auth file not found"; exit 1; }
     jq empty "$INTERNAL_REGISTRY_AUTH" 2>/dev/null || { log "ERROR" "Invalid JSON in internal auth"; exit 1; }
     log "SUCCESS" "Internal registry auth file is valid"
+fi
+
+if [[ -n "${INTERNAL_REGISTRY_PROXY_AUTH:-}" ]]; then
+    log "INFO" "Validating internal registry proxy auth file: $INTERNAL_REGISTRY_PROXY_AUTH"
+    [[ ! -f "$INTERNAL_REGISTRY_PROXY_AUTH" ]] && { log "ERROR" "Internal registry proxy auth file not found"; exit 1; }
+    jq empty "$INTERNAL_REGISTRY_PROXY_AUTH" 2>/dev/null || { log "ERROR" "Invalid JSON in internal registry proxy auth"; exit 1; }
+    log "SUCCESS" "Internal registry proxy auth file is valid"
 fi
 
 log "INFO" "Checking cluster connectivity"
@@ -235,6 +271,91 @@ log "INFO" "Detecting OpenShift version..."
 VERSION=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null | cut -d. -f1-2)
 [[ -z "$VERSION" ]] && { log "ERROR" "Could not detect cluster version"; exit 1; }
 log "SUCCESS" "Detected OpenShift version: $VERSION"
+
+# Helper function to update cluster pull-secret with auth credentials
+update_cluster_pull_secret() {
+    local auth_file=$1
+
+    log "INFO" "Updating cluster pull-secret with content of $auth_file"
+
+    log "INFO" "Retrieving current cluster pull-secret..."
+    current_pull_secret=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    log "SUCCESS" "Retrieved current pull-secret"
+
+    log "INFO" "Merging pull-secrets..."
+    auth_content=$(cat "$auth_file")
+
+    # Create a temporary file for the merged auth
+    merged_auth_file=$(mktemp)
+
+    # Create temporary files for the JSON inputs
+    current_auth_file=$(mktemp)
+    new_auth_file=$(mktemp)
+    echo "$current_pull_secret" > "$current_auth_file"
+    echo "$auth_content" > "$new_auth_file"
+
+    # Debug: Check the content of the files
+    log "INFO" "Debugging JSON inputs..."
+    log "INFO" "Current pull-secret file size: $(wc -c < "$current_auth_file") bytes"
+    log "INFO" "Auth file size: $(wc -c < "$new_auth_file") bytes"
+
+    # Validate JSON inputs before merging
+    if ! jq empty "$current_auth_file" 2>/dev/null; then
+        log "ERROR" "Current pull-secret is not valid JSON"
+        log "ERROR" "First 200 chars of current pull-secret: $(head -c 200 "$current_auth_file")"
+        rm -f "$current_auth_file" "$new_auth_file" "$merged_auth_file"
+        exit 1
+    fi
+
+    if ! jq empty "$new_auth_file" 2>/dev/null; then
+        log "ERROR" "Auth content is not valid JSON"
+        log "ERROR" "First 200 chars of auth: $(head -c 200 "$new_auth_file")"
+        rm -f "$current_auth_file" "$new_auth_file" "$merged_auth_file"
+        exit 1
+    fi
+
+    # Check if both files have the expected structure
+    if ! jq -e '.auths' "$current_auth_file" >/dev/null 2>&1; then
+        log "ERROR" "Current pull-secret does not contain 'auths' field"
+        log "ERROR" "Current pull-secret structure: $(jq keys "$current_auth_file" 2>/dev/null || echo 'Invalid JSON')"
+        rm -f "$current_auth_file" "$new_auth_file" "$merged_auth_file"
+        exit 1
+    fi
+
+    if ! jq -e '.auths' "$new_auth_file" >/dev/null 2>&1; then
+        log "ERROR" "Auth does not contain 'auths' field"
+        log "ERROR" "Auth structure: $(jq keys "$new_auth_file" 2>/dev/null || echo 'Invalid JSON')"
+        rm -f "$current_auth_file" "$new_auth_file" "$merged_auth_file"
+        exit 1
+    fi
+
+    log "INFO" "Both JSON files are valid and contain 'auths' fields"
+
+    jq -s '
+        .[0].auths as $current |
+        .[1].auths as $new |
+        {
+            auths: ($current + $new)
+        }
+    ' "$current_auth_file" "$new_auth_file" > "$merged_auth_file"
+
+    # Cleanup temporary files
+    rm -f "$current_auth_file" "$new_auth_file"
+
+    # Apply the merged auth
+    log "INFO" "Comparing current and updated pull-secret..."
+    if ! cmp -s <(echo "$current_pull_secret" | jq -S) "$merged_auth_file"; then
+        log "INFO" "Updating cluster pull-secret..."
+        cat "$merged_auth_file" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
+            { log "ERROR" "Failed to update cluster pull-secret"; rm -f "$merged_auth_file"; exit 1; }
+        log "SUCCESS" "Updated cluster pull-secret"
+    else
+        log "SUCCESS" "Pull-secret already contains all required credentials"
+    fi
+
+    # Cleanup
+    rm -f "$merged_auth_file"
+}
 
 # Helper function to get FBC tag for operator
 get_fbc_tag() {
@@ -249,6 +370,23 @@ get_fbc_tag() {
         local-storage) echo "ocp__${ver}__ose-local-storage-rhel9-operator" ;;
         *) echo "" ;;
     esac
+}
+
+# Helper function to set FBC target
+set_fbc_target() {
+    local operator_name=$1
+    local fbc_tag=$2
+
+    OPERATOR_FBC_SOURCES[$operator_name]="${ART_FBC_BASE}:${fbc_tag}"
+    OPERATOR_FBC_TARGETS[$operator_name]="${OPERATOR_FBC_SOURCES[$operator_name]}"
+
+    if [[ "$DISCONNECTED" == true ]]; then
+        local registry_target="${INTERNAL_REGISTRY:-}"
+        if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+            registry_target="${INTERNAL_REGISTRY_PROXY:-}"
+        fi
+        OPERATOR_FBC_TARGETS[$operator_name]="${registry_target}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+    fi
 }
 
 # Helper function to deploy CatalogSource
@@ -448,7 +586,7 @@ declare -A OPERATOR_CHANNELS
 declare -A OPERATOR_INSTALL_MODES
 
 # Unified deployment configuration
-# OPERATORS array will contain either operator names or FBC tags
+# DEPLOYMENT_KEYS array will contain either operator names or FBC tags
 declare -a DEPLOYMENT_KEYS=()
 
 if [[ ${#OPERATORS[@]} -gt 0 ]]; then
@@ -457,159 +595,79 @@ if [[ ${#OPERATORS[@]} -gt 0 ]]; then
         fbc_tag=$(get_fbc_tag "$op" "$VERSION")
         DEPLOYMENT_KEYS+=("$op")
         OPERATOR_CATALOG_NAMES[$op]="${op}-konflux"
-        OPERATOR_FBC_SOURCES[$op]="${ART_FBC_BASE}:${fbc_tag}"
-        OPERATOR_FBC_TARGETS[$op]="${OPERATOR_FBC_SOURCES[$op]}"
-        if [[ "$DISCONNECTED" == true ]]; then
-            OPERATOR_FBC_TARGETS[$op]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
-        fi
+        set_fbc_target "$op" "$fbc_tag"
     done
 else
+    # FBC tag mode: use provided FBC tags directly
     for fbc_tag in "${FBC_TAGS[@]}"; do
-        # Use FBC tag as the deployment key
         DEPLOYMENT_KEYS+=("$fbc_tag")
         # Create a sanitized catalog name from the FBC tag
         catalog_name=$(echo "$fbc_tag" | tr ':' '-' | tr '/' '-' | tr '_' '-')
         OPERATOR_CATALOG_NAMES[$fbc_tag]="${catalog_name}-konflux"
-        OPERATOR_FBC_SOURCES[$fbc_tag]="${ART_FBC_BASE}:${fbc_tag}"
-        OPERATOR_FBC_TARGETS[$fbc_tag]="${OPERATOR_FBC_SOURCES[$fbc_tag]}"
-        if [[ "$DISCONNECTED" == true ]]; then
-            OPERATOR_FBC_TARGETS[$fbc_tag]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
-        fi
+        set_fbc_target "$fbc_tag" "$fbc_tag"
     done
 fi
 
 # Authenticate registries
 
 if [[ "$DISCONNECTED" == true ]]; then
-    quay_auth_b64=""
-    quay_auth_source=""
-    
-    # Priority 1: Try specific repository auth (quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share)
-    quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
-    if [[ -n "$quay_auth_key" ]]; then
-        quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
-        quay_auth_source="$quay_auth_key"
-    fi
-    
-    # Priority 2: Try broader repository auth (quay.io/redhat-user-workloads)
-    if [[ -z "$quay_auth_b64" ]]; then
-        quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
+    # Authenticate to internal registry for mirroring
+    if [[ "$USE_REGISTRY_PROXY" == false ]]; then
+        quay_auth_b64=""
+        quay_auth_source=""
+
+        # Priority 1: Try specific repository auth (quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share)
+        quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
         if [[ -n "$quay_auth_key" ]]; then
             quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
             quay_auth_source="$quay_auth_key"
         fi
-    fi
-    
-    # Priority 3: Fall back to general quay.io domain auth
-    if [[ -z "$quay_auth_b64" ]]; then
-        quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | test("^(https://)?quay\\.io/?$")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
-        if [[ -n "$quay_auth_key" ]]; then
-            quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
-            quay_auth_source="$quay_auth_key"
+
+        # Priority 2: Try broader repository auth (quay.io/redhat-user-workloads)
+        if [[ -z "$quay_auth_b64" ]]; then
+            quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
+            if [[ -n "$quay_auth_key" ]]; then
+                quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
+                quay_auth_source="$quay_auth_key"
+            fi
         fi
-    fi
-    
-    if [[ -n "$quay_auth_b64" ]]; then
-        quay_user=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f1)
-        quay_pass=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f2-)
-        echo "Authenticating to quay.io using credentials from: $quay_auth_source"
-        echo "  Username: $quay_user"
-        echo "$quay_pass" | podman login --username "$quay_user" --password-stdin quay.io >/dev/null 2>&1
-    else
-        echo "Authenticating to quay.io using authfile: $QUAY_AUTH"
-        podman login --authfile="$QUAY_AUTH" quay.io >/dev/null 2>&1
-    fi || { echo "ERROR: Failed to auth quay.io" >&2; exit 1; }
-    
-    internal_auth_b64=$(jq -r --arg reg "$INTERNAL_REGISTRY" '.auths[$reg].auth // empty' "$INTERNAL_REGISTRY_AUTH" 2>/dev/null)
-    if [[ -n "$internal_auth_b64" ]]; then
-        internal_user=$(echo "$internal_auth_b64" | base64 -d | cut -d: -f1)
-        internal_pass=$(echo "$internal_auth_b64" | base64 -d | cut -d: -f2-)
-        echo "$internal_pass" | podman login --username "$internal_user" --password-stdin "$INTERNAL_REGISTRY" >/dev/null 2>&1
-    else
-        podman login --authfile="$INTERNAL_REGISTRY_AUTH" "$INTERNAL_REGISTRY" >/dev/null 2>&1
-    fi || { echo "ERROR: Failed to auth internal registry" >&2; exit 1; }
-else
-    if [[ -n "${QUAY_AUTH:-}" ]]; then
-        log "INFO" "Updating cluster pull-secret with quay.io credentials"
-        
-        log "INFO" "Retrieving current cluster pull-secret..."
-        current_pull_secret=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
-        log "SUCCESS" "Retrieved current pull-secret"
-        
-        log "INFO" "Merging quay.io credentials into pull-secret..."
-        quay_auth_content=$(cat "$QUAY_AUTH")
-        
-        # Create a temporary file for the merged auth
-        merged_auth_file=$(mktemp)
-        
-        # Merge auth entries, only adding new ones that don't exist
-        # Create temporary files for the JSON inputs
-        current_auth_file=$(mktemp)
-        quay_auth_file=$(mktemp)
-        echo "$current_pull_secret" > "$current_auth_file"
-        echo "$quay_auth_content" > "$quay_auth_file"
-        
-        # Debug: Check the content of the files
-        log "INFO" "Debugging JSON inputs..."
-        log "INFO" "Current pull-secret file size: $(wc -c < "$current_auth_file") bytes"
-        log "INFO" "Quay auth file size: $(wc -c < "$quay_auth_file") bytes"
-        
-        # Validate JSON inputs before merging
-        if ! jq empty "$current_auth_file" 2>/dev/null; then
-            log "ERROR" "Current pull-secret is not valid JSON"
-            log "ERROR" "First 200 chars of current pull-secret: $(head -c 200 "$current_auth_file")"
-            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
-            exit 1
+
+        # Priority 3: Fall back to general quay.io domain auth
+        if [[ -z "$quay_auth_b64" ]]; then
+            quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | test("^(https://)?quay\\.io/?$")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
+            if [[ -n "$quay_auth_key" ]]; then
+                quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
+                quay_auth_source="$quay_auth_key"
+            fi
         fi
-        
-        if ! jq empty "$quay_auth_file" 2>/dev/null; then
-            log "ERROR" "Quay auth content is not valid JSON"
-            log "ERROR" "First 200 chars of quay auth: $(head -c 200 "$quay_auth_file")"
-            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
-            exit 1
-        fi
-        
-        # Check if both files have the expected structure
-        if ! jq -e '.auths' "$current_auth_file" >/dev/null 2>&1; then
-            log "ERROR" "Current pull-secret does not contain 'auths' field"
-            log "ERROR" "Current pull-secret structure: $(jq keys "$current_auth_file" 2>/dev/null || echo 'Invalid JSON')"
-            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
-            exit 1
-        fi
-        
-        if ! jq -e '.auths' "$quay_auth_file" >/dev/null 2>&1; then
-            log "ERROR" "Quay auth does not contain 'auths' field"
-            log "ERROR" "Quay auth structure: $(jq keys "$quay_auth_file" 2>/dev/null || echo 'Invalid JSON')"
-            rm -f "$current_auth_file" "$quay_auth_file" "$merged_auth_file"
-            exit 1
-        fi
-        
-        log "INFO" "Both JSON files are valid and contain 'auths' fields"
-        
-        jq -s '
-            .[0].auths as $current |
-            .[1].auths as $new |
-            {
-                auths: ($current + $new)
-            }
-        ' "$current_auth_file" "$quay_auth_file" > "$merged_auth_file"
-        
-        # Cleanup temporary files
-        rm -f "$current_auth_file" "$quay_auth_file"
-        
-        # Apply the merged auth
-        log "INFO" "Comparing current and updated pull-secret..."
-        if ! cmp -s <(echo "$current_pull_secret" | jq -S) "$merged_auth_file"; then
-            log "INFO" "Updating cluster pull-secret with new quay.io credentials..."
-            cat "$merged_auth_file" | oc set data secret/pull-secret -n openshift-config --from-file=.dockerconfigjson=/dev/stdin || \
-                { log "ERROR" "Failed to update cluster pull-secret"; rm -f "$merged_auth_file"; exit 1; }
-            log "SUCCESS" "Updated cluster pull-secret with quay.io credentials"
+
+        if [[ -n "$quay_auth_b64" ]]; then
+            quay_user=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f1)
+            quay_pass=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f2-)
+            echo "Authenticating to quay.io using credentials from: $quay_auth_source"
+            echo "  Username: $quay_user"
+            echo "$quay_pass" | podman login --username "$quay_user" --password-stdin quay.io >/dev/null 2>&1
         else
-            log "SUCCESS" "Pull-secret already contains all required quay.io credentials"
-        fi
-        
-        # Cleanup
-        rm -f "$merged_auth_file"
+            echo "Authenticating to quay.io using authfile: $QUAY_AUTH"
+            podman login --authfile="$QUAY_AUTH" quay.io >/dev/null 2>&1
+        fi || { echo "ERROR: Failed to auth quay.io" >&2; exit 1; }
+
+        internal_auth_b64=$(jq -r --arg reg "$INTERNAL_REGISTRY" '.auths[$reg].auth // empty' "$INTERNAL_REGISTRY_AUTH" 2>/dev/null)
+        if [[ -n "$internal_auth_b64" ]]; then
+            internal_user=$(echo "$internal_auth_b64" | base64 -d | cut -d: -f1)
+            internal_pass=$(echo "$internal_auth_b64" | base64 -d | cut -d: -f2-)
+            echo "$internal_pass" | podman login --username "$internal_user" --password-stdin "$INTERNAL_REGISTRY" >/dev/null 2>&1
+        else
+            podman login --authfile="$INTERNAL_REGISTRY_AUTH" "$INTERNAL_REGISTRY" >/dev/null 2>&1
+        fi || { echo "ERROR: Failed to auth internal registry" >&2; exit 1; }
+    else
+        # When using proxy in disconnected mode, update cluster pull-secret with internal registry auth
+        update_cluster_pull_secret "$INTERNAL_REGISTRY_PROXY_AUTH"
+    fi
+else
+    # Connected mode - update pull-secret with quay auth if provided
+    if [[ -n "${QUAY_AUTH:-}" ]]; then
+        update_cluster_pull_secret "$QUAY_AUTH"
     fi
 fi
 
@@ -627,8 +685,8 @@ for op in "${DEPLOYMENT_KEYS[@]}"; do
     fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
     fbc_target="${OPERATOR_FBC_TARGETS[$op]}"
     
-    # Mirror FBC image if disconnected
-    if [[ "$DISCONNECTED" == true ]]; then
+    # Mirror FBC image if disconnected and not using proxy
+    if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
         echo "Mirroring FBC image..."
         mirror_output=$(oc image mirror --keep-manifest-list=true "$fbc_source" "$fbc_target" 2>&1)
         mirror_status=$?
@@ -701,8 +759,8 @@ echo "============================================================"
 echo "Total unique images across all operators: $total_images"
 echo "============================================================"
 
-# Mirror all related images if disconnected
-if [[ "$DISCONNECTED" == true ]]; then
+# Mirror all related images if disconnected and not using proxy
+if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
     # Merge quay and internal auth files for oc image mirror (pull+push)
     MERGED_AUTH_FILE=$(mktemp)
     jq -s '{auths: (.[0].auths + .[1].auths)}' "$QUAY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
@@ -760,7 +818,11 @@ log_step "IDMS" "Creating Image Digest Mirror Sets (IDMS)"
 log "INFO" "Generating IDMS for each operator/FBC tag"
 
 if [[ "$DISCONNECTED" == true ]]; then
-    IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+    mirror_registry="${INTERNAL_REGISTRY:-}"
+    if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+        mirror_registry="${INTERNAL_REGISTRY_PROXY}"
+    fi
+    IDMS_MIRROR="${mirror_registry}/redhat-user-workloads/ocp-art-tenant/art-images-share"
     IDMS_SUFFIX="internal-idms"
 else
     IDMS_MIRROR="${ART_IMAGES_SOURCE}"
@@ -827,9 +889,14 @@ log "INFO" "Configuring cluster settings"
 
 if [[ "$DISCONNECTED" == true ]]; then
     log "INFO" "Adding insecure registry configuration..."
-    oc patch image.config.openshift.io/cluster --patch '{"spec":{ "registrySources": { "insecureRegistries" : ["'"${INTERNAL_REGISTRY}"'"] }}}' --type=merge || \
+    # Use proxy registry if provided, otherwise use internal registry
+    registry_to_configure="${INTERNAL_REGISTRY:-}"
+    if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+        registry_to_configure="${INTERNAL_REGISTRY_PROXY}"
+    fi
+    oc patch image.config.openshift.io/cluster --patch '{"spec":{ "registrySources": { "insecureRegistries" : ["'"${registry_to_configure}"'"] }}}' --type=merge || \
         { log "ERROR" "Failed to patch image config"; exit 1; }
-    
+
     log "INFO" "Waiting for Machine Config Pool update after registry config..."
     oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
     oc wait --for=condition=Updating=false mcp --all --timeout=${MCP_TIMEOUT} >/dev/null 2>&1 || true
