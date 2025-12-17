@@ -207,15 +207,13 @@ else
     log "INFO" "Operating in connected cluster mode"
 fi
 
-# Determine if we should use proxy registry
+# Determine if we should use proxy registry (default: false - use mirroring)
+USE_REGISTRY_PROXY=false
+
 if [[ -n "${INTERNAL_REGISTRY_PROXY:-}" ]]; then
     USE_REGISTRY_PROXY=true
     log "INFO" "Using proxy registry - images will not be mirrored"
-else
-    USE_REGISTRY_PROXY=false
-    log "INFO" "Using internal registry with image mirroring enabled"
 fi
-
 log "INFO" "Checking required tools"
 
 # Check core tools (always required)
