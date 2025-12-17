@@ -659,7 +659,7 @@ if [[ "$DISCONNECTED" == true ]]; then
             podman login --authfile="$INTERNAL_REGISTRY_AUTH" "$INTERNAL_REGISTRY" >/dev/null 2>&1
         fi || { echo "ERROR: Failed to auth internal registry" >&2; exit 1; }
     else
-        # When using proxy in disconnected mode, update cluster pull-secret with internal registry auth
+        # When using proxy in disconnected mode, update cluster pull-secret with internal registry proxy auth
         update_cluster_pull_secret "$INTERNAL_REGISTRY_PROXY_AUTH"
     fi
 else
