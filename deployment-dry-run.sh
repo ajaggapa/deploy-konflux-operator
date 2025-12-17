@@ -147,7 +147,8 @@ print_step() {
 }
 
 if [[ "$#" -eq 0 ]]; then
-    echo "Usage: $0 [--operator <name>[,<name>...> | --fbc-tag <tag>[,<tag>...]] [--internal-registry REG]"
+    echo "Usage: $0 [--operator <name>[,<name>...> | --fbc-tag <tag>[,<tag>...]]"
+    echo "          [--internal-registry REG | --internal-registry-proxy REG]"
     exit 1
 fi
 
@@ -168,6 +169,10 @@ while [[ $# -gt 0 ]]; do
             INTERNAL_REGISTRY="$2"
             shift 2
             ;;
+        --internal-registry-proxy)
+            INTERNAL_REGISTRY_PROXY="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
             exit 1
@@ -185,6 +190,12 @@ if [[ -z "${OPERATOR:-}" && -z "${FBC_TAG_INPUT:-}" ]]; then
     exit 1
 fi
 
+# Validate mutual exclusivity of registry modes
+if [[ -n "${INTERNAL_REGISTRY:-}" && -n "${INTERNAL_REGISTRY_PROXY:-}" ]]; then
+    echo "ERROR: Cannot use both --internal-registry and --internal-registry-proxy"
+    exit 1
+fi
+
 if [[ -n "${OPERATOR:-}" ]]; then
     IFS=',' read -ra OPERATORS <<< "$OPERATOR"
     for op in "${OPERATORS[@]}"; do
@@ -198,8 +209,13 @@ else
 fi
 
 DISCONNECTED=false
+USE_REGISTRY_PROXY=false
+
 if [[ -n "${INTERNAL_REGISTRY:-}" ]]; then
     DISCONNECTED=true
+elif [[ -n "${INTERNAL_REGISTRY_PROXY:-}" ]]; then
+    DISCONNECTED=true
+    USE_REGISTRY_PROXY=true
 fi
 
 echo "Dry-run mode: no cluster changes will be made."
@@ -236,7 +252,11 @@ if ((${#OPERATORS[@]} > 0)); then
         CATALOG_NAMES[$op]="${op}-konflux"
         FBC_SOURCES[$op]="${ART_FBC_BASE}:${fbc_tag}"
         if [[ "$DISCONNECTED" == true ]]; then
-            FBC_TARGETS[$op]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+            registry_target="${INTERNAL_REGISTRY:-}"
+            if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+                registry_target="${INTERNAL_REGISTRY_PROXY}"
+            fi
+            FBC_TARGETS[$op]="${registry_target}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
         else
             FBC_TARGETS[$op]="${FBC_SOURCES[$op]}"
         fi
@@ -248,7 +268,11 @@ else
         CATALOG_NAMES[$fbc_tag]="${sanitized}-konflux"
         FBC_SOURCES[$fbc_tag]="${ART_FBC_BASE}:${fbc_tag}"
         if [[ "$DISCONNECTED" == true ]]; then
-            FBC_TARGETS[$fbc_tag]="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
+            registry_target="${INTERNAL_REGISTRY:-}"
+            if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+                registry_target="${INTERNAL_REGISTRY_PROXY}"
+            fi
+            FBC_TARGETS[$fbc_tag]="${registry_target}/redhat-user-workloads/ocp-art-tenant/art-fbc:${fbc_tag}"
         else
             FBC_TARGETS[$fbc_tag]="${FBC_SOURCES[$fbc_tag]}"
         fi
@@ -257,18 +281,26 @@ fi
 
 print_step 1 "Authenticate to registries"
 if [[ "$DISCONNECTED" == true ]]; then
-    echo "  podman login --authfile <quay-auth.json> quay.io"
-    echo "  podman login --authfile <internal-registry-auth.json> ${INTERNAL_REGISTRY}"
+    if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+        echo "  # Proxy mode: Update cluster pull-secret with proxy registry auth"
+        echo "  (deploy-operator.sh will merge internal-registry-proxy-auth.json into cluster pull-secret)"
+    else
+        echo "  # Mirror mode: Authenticate using podman for image mirroring"
+        echo "  podman login --authfile <quay-auth.json> quay.io"
+        echo "  podman login --authfile <internal-registry-auth.json> ${INTERNAL_REGISTRY}"
+    fi
 else
     echo "  podman login --authfile <quay-auth.json> quay.io    # optional if cluster already has access"
     echo "  (deploy-operator.sh merges this auth into the cluster pull-secret when provided)"
 fi
 
-print_step 2 "Mirror FBC images (Disconnected only)"
-if [[ "$DISCONNECTED" == true ]]; then
+print_step 2 "Mirror FBC images (Disconnected mirror mode only)"
+if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
     for key in "${DEPLOYMENT_KEYS[@]}"; do
         echo "  oc image mirror --keep-manifest-list=true \"${FBC_SOURCES[$key]}\" \"${FBC_TARGETS[$key]}\""
     done
+elif [[ "$USE_REGISTRY_PROXY" == true ]]; then
+    echo "  Proxy mode: Images pulled through proxy registry - no mirroring needed"
 else
     echo "  Connected cluster: script reads FBC images directly from quay.io"
 fi
@@ -321,8 +353,8 @@ for key in "${DEPLOYMENT_KEYS[@]}"; do
     printf '    - %s\n' $related_images
 done
 
-print_step 4 "Mirror related images (Disconnected only)"
-if [[ "$DISCONNECTED" == true ]]; then
+print_step 4 "Mirror related images (Disconnected mirror mode only)"
+if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
     digest_target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
     for key in "${DEPLOYMENT_KEYS[@]}"; do
         related_list="${OPERATOR_RELATED_IMAGES[$key]}"
@@ -335,6 +367,8 @@ if [[ "$DISCONNECTED" == true ]]; then
             echo "  oc image mirror --keep-manifest-list=true -a <auth-file-path-with-quay-and-internal-registry-auth> \"${ART_IMAGES_SOURCE}@${digest}\" \"${digest_target}\""
         done <<< "$related_list"
     done
+elif [[ "$USE_REGISTRY_PROXY" == true ]]; then
+    echo "  Proxy mode: Images pulled through proxy registry - no mirroring needed"
 else
     echo "  Connected cluster: use related images directly from quay.io"
 fi
@@ -350,7 +384,11 @@ fi
 
 print_step 6 "Configure insecure registry (Disconnected only)"
 if [[ "$DISCONNECTED" == true ]]; then
-    echo "  oc patch image.config.openshift.io/cluster --patch '{\"spec\":{\"registrySources\":{\"insecureRegistries\":[\"${INTERNAL_REGISTRY}\"]}}}' --type=merge"
+    registry_to_configure="${INTERNAL_REGISTRY:-}"
+    if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+        registry_to_configure="${INTERNAL_REGISTRY_PROXY}"
+    fi
+    echo "  oc patch image.config.openshift.io/cluster --patch '{\"spec\":{\"registrySources\":{\"insecureRegistries\":[\"${registry_to_configure}\"]}}}' --type=merge"
 else
     echo "  Connected cluster: no insecure registry configuration required."
 fi
@@ -358,7 +396,11 @@ fi
 IDMS_MIRROR="$ART_IMAGES_SOURCE"
 IDMS_SUFFIX="art-idms"
 if [[ "$DISCONNECTED" == true ]]; then
-    IDMS_MIRROR="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+    mirror_registry="${INTERNAL_REGISTRY:-}"
+    if [[ "$USE_REGISTRY_PROXY" == true ]]; then
+        mirror_registry="${INTERNAL_REGISTRY_PROXY}"
+    fi
+    IDMS_MIRROR="${mirror_registry}/redhat-user-workloads/ocp-art-tenant/art-images-share"
     IDMS_SUFFIX="internal-idms"
 fi
 

@@ -6,9 +6,9 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Procedure](#procedure)
-- [Dry-Run Planning](#dry-run-planning)
 - [Arguments](#arguments)
 - [Usage](#usage)
+- [Dry-Run Planning](#dry-run-planning)
 
 ---
 
@@ -83,7 +83,9 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 
 ---
 
-## Disconnected Cluster Image Flow
+## Disconnected Cluster Image Flow (Mirror Mode)
+
+> **Note:** This diagram shows **mirror mode**. In **proxy mode**, steps ① and ② (mirroring FBC and related images) are skipped. Instead, the cluster pulls images directly through the registry proxy, which forwards requests to quay.io.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -169,7 +171,7 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 - **oc** - OpenShift CLI
 - **opm** - Operator Package Manager
 - **jq** - JSON processor  
-- **podman** - Container tool for authentication
+- **podman** - Container tool for authentication (required for disconnected mirror mode or when using --quay-auth in connected mode; not required for disconnected proxy mode)
 
 ---
 
@@ -177,12 +179,12 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 
 The script follows these steps when deploying an operator:
 
-1. **Authenticate to registries** - Validates Quay.io and internal registry credentials
-2. **Mirror FBC images** (Disconnected only) - Copies FBC images to internal registry
+1. **Authenticate to registries** - Validates Quay.io and internal registry credentials (mirror mode) or updates cluster pull-secret (proxy mode)
+2. **Mirror FBC images** (Disconnected mirror mode only) - Copies FBC images to internal registry
 3. **Extract metadata** - Reads operator details (name, namespace, channel, install mode) from FBC
-4. **Mirror related images** (Disconnected only) - Copies all operator container images to internal registry
-5. **Update cluster pull-secret** (Connected only) - Adds Quay.io credentials to cluster
-6. **Configure insecure registry** (Disconnected only) - Adds internal registry to cluster configuration
+4. **Mirror related images** (Disconnected mirror mode only) - Copies all operator container images to internal registry
+5. **Update cluster pull-secret** (Connected mode or disconnected proxy mode) - Adds credentials to cluster
+6. **Configure insecure registry** (Disconnected only) - Adds internal registry or proxy to cluster configuration
 7. **Create IDMS** - Sets up image redirect rules (one per operator)
 8. **Wait for MCP update** - Waits for cluster nodes to apply new configuration (once for all operators)
 9. **Create CatalogSource** - Registers operator catalog
@@ -194,59 +196,27 @@ The script follows these steps when deploying an operator:
 
 ---
 
-## Dry-Run Planning
-
-Use `deployment-dry-run.sh` when you want to validate the entire workflow without touching a cluster. The script reproduces the Procedure above step-by-step and prints:
-
-- Every command you would run locally (`podman login`, `oc image mirror`, `oc wait`, etc.)
-- All YAML manifests (IDMS, CatalogSource, Namespace, OperatorGroup, Subscription) wrapped in copy/paste friendly `oc apply -f -` snippets
-- Clear stage markers (`Step 1 … Step 14`) so you can follow along with the Procedure section while executing manually
-
-Because it never mutates a cluster, the dry-run script only needs minimal inputs:
-
-| Argument | Description | Required |
-|----------|-------------|----------|
-| `--operator <name>` | Same operator list as the deployment script. Supports comma-separated values. | Yes* |
-| `--fbc-tag <tags>` | Custom FBC tag(s); mutually exclusive with `--operator`. | Yes* |
-| `--internal-registry <host:port>` | When provided, the dry-run treats the scenario as disconnected and prints the mirror commands/patches for that registry. | No |
-
-Notes:
-- Provide either `--operator` or `--fbc-tag`.
-- No auth file flags are needed; the output simply references placeholder paths so you can substitute your own secrets.
-
-### Dry-run Examples
-
-```bash
-# Connected cluster dry run for sriov operator
-./deployment-dry-run.sh --operator sriov
-
-# Disconnected dry run for sriov + metallb using a custom registry
-./deployment-dry-run.sh \
-  --operator sriov,metallb \
-  --internal-registry registry.example.com:5000
-```
-
-Review the generated steps from top to bottom; once satisfied, rerun the same inputs with `deploy-operator.sh` to apply the changes for real.
-
----
-
 ## Arguments
 
 | Argument | Description | Required |
 |----------|-------------|----------|
 | `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes* |
 | `--fbc-tag <tags>` | Custom FBC image tag(s). Alternative to `--operator` for advanced usage. Supports comma-separated list for multiple tags (e.g., `ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-sriov-network-rhel9-operator`) | Yes* |
-| `--internal-registry <host:port>` | Internal registry location (enables disconnected mode) | No |
+| `--internal-registry <host:port>` | Internal registry location for **mirror mode** (enables disconnected mode with image mirroring) | No |
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
+| `--internal-registry-proxy <host:port>` | Internal registry proxy for **proxy mode** (enables disconnected mode without image mirroring) | No |
+| `--internal-registry-proxy-auth <file>` | Auth file for internal registry proxy (required if `--internal-registry-proxy` is set) | Conditional |
 | `--quay-auth <file>` | Quay.io authentication file | Conditional |
 | `--mcp-timeout <duration>` | Timeout duration for MachineConfigPool updates (e.g., `600s`). Default: `600s` | No |
 
 **Notes:**
 - **Either** `--operator` **or** `--fbc-tag` is required (not both)
 - Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`
-- Disconnected mode requires both `--internal-registry` and `--internal-registry-auth`
-- Script automatically detects mode based on `--internal-registry` presence
-- `--quay-auth` is required for disconnected mode, optional for connected mode if cluster's pull-secret already contains auth for quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share repository
+- **Disconnected mirror mode** requires `--internal-registry` and `--internal-registry-auth` (mirrors all images)
+- **Disconnected proxy mode** requires `--internal-registry-proxy` and `--internal-registry-proxy-auth` (no mirroring, images pulled through proxy)
+- Cannot use both `--internal-registry` and `--internal-registry-proxy` simultaneously
+- `--quay-auth` is required for disconnected **mirror mode**, not needed for disconnected **proxy mode**
+- `--quay-auth` is optional for connected mode if cluster's pull-secret already contains auth for quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share repository
 - For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
 
 **Environment Variables:**
@@ -305,7 +275,7 @@ Review the generated steps from top to bottom; once satisfied, rerun the same in
 
 ---
 
-### Disconnected Cluster
+### Disconnected Cluster - Mirror Mode
 
 **Predefined Telco Operators:**
 ```bash
@@ -341,7 +311,45 @@ Review the generated steps from top to bottom; once satisfied, rerun the same in
   --quay-auth /path/to/quay-auth.json
 ```
 
-**Custom MCP Timeout (for larger clusters):**
+---
+
+### Disconnected Cluster - Proxy Mode
+
+**Predefined Telco Operators:**
+```bash
+# Single operator
+./deploy-operator.sh \
+  --operator sriov \
+  --internal-registry-proxy proxy.example.com:5000 \
+  --internal-registry-proxy-auth /path/to/internal-proxy-auth.json
+
+# Multiple operators
+./deploy-operator.sh \
+  --operator sriov,metallb,nmstate,ptp,pfstatus \
+  --internal-registry-proxy proxy.example.com:5000 \
+  --internal-registry-proxy-auth /path/to/internal-proxy-auth.json
+```
+
+**Custom FBC Tag:**
+```bash
+# Single FBC tag
+./deploy-operator.sh \
+  --fbc-tag ocp__4.21__ose-sriov-network-rhel9-operator \
+  --internal-registry-proxy proxy.example.com:5000 \
+  --internal-registry-proxy-auth /path/to/internal-proxy-auth.json
+
+# Multiple FBC tags (comma-separated)
+./deploy-operator.sh \
+  --fbc-tag ocp__4.21__ose-sriov-network-rhel9-operator,ocp__4.21__metallb-rhel9-operator \
+  --internal-registry-proxy proxy.example.com:5000 \
+  --internal-registry-proxy-auth /path/to/internal-proxy-auth.json
+```
+
+---
+
+### Custom MCP Timeout
+
+**For larger clusters (mirror mode):**
 ```bash
 ./deploy-operator.sh \
   --operator sriov,metallb,ptp \
@@ -350,5 +358,57 @@ Review the generated steps from top to bottom; once satisfied, rerun the same in
   --quay-auth /path/to/quay-auth.json \
   --mcp-timeout 20m
 ```
+
+**For larger clusters (proxy mode):**
+```bash
+./deploy-operator.sh \
+  --operator sriov,metallb,ptp \
+  --internal-registry-proxy proxy.example.com:5000 \
+  --internal-registry-proxy-auth /path/to/internal-proxy-auth.json \
+  --mcp-timeout 20m
+```
+
+---
+
+## Dry-Run Planning
+
+Use `deployment-dry-run.sh` when you want to validate the entire workflow without touching a cluster. The script reproduces the Procedure above step-by-step and prints:
+
+- Every command you would run locally (`podman login`, `oc image mirror`, `oc wait`, etc.)
+- All YAML manifests (IDMS, CatalogSource, Namespace, OperatorGroup, Subscription) wrapped in copy/paste friendly `oc apply -f -` snippets
+- Clear stage markers (`Step 1 … Step 14`) so you can follow along with the Procedure section while executing manually
+
+Because it never mutates a cluster, the dry-run script only needs minimal inputs:
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `--operator <name>` | Same operator list as the deployment script. Supports comma-separated values. | Yes* |
+| `--fbc-tag <tags>` | Custom FBC tag(s); mutually exclusive with `--operator`. | Yes* |
+| `--internal-registry <host:port>` | Treats the scenario as disconnected with image mirroring. | No |
+| `--internal-registry-proxy <host:port>` | Treats the scenario as disconnected with registry proxy (no mirroring). | No |
+
+Notes:
+- Provide either `--operator` or `--fbc-tag`.
+- Use either `--internal-registry` (mirror mode) or `--internal-registry-proxy` (proxy mode), not both.
+- No auth file flags are needed; the output references placeholder paths.
+
+### Dry-run Examples
+
+```bash
+# Connected cluster dry run for sriov operator
+./deployment-dry-run.sh --operator sriov
+
+# Disconnected dry run with mirror mode
+./deployment-dry-run.sh \
+  --operator sriov,metallb \
+  --internal-registry registry.example.com:5000
+
+# Disconnected dry run with proxy mode
+./deployment-dry-run.sh \
+  --operator sriov,metallb \
+  --internal-registry-proxy proxy.example.com:5000
+```
+
+Review the generated steps from top to bottom; once satisfied, rerun the same inputs with `deploy-operator.sh` to apply the changes for real.
 
 ---
