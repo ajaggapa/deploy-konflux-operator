@@ -222,8 +222,8 @@ for cmd in oc opm jq; do
     command -v "$cmd" >/dev/null 2>&1 || { log "ERROR" "$cmd not installed"; exit 1; }
 done
 
-# Check podman (required for disconnected clusters with internal registry or when quay-auth is provided)
-if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]] || [[ -n "${QUAY_AUTH:-}" ]]; then
+# Check podman (required for disconnected clusters with internal registry)
+if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
     log "INFO" "Checking for podman (required for registry authentication)..."
     command -v "podman" >/dev/null 2>&1 || { log "ERROR" "podman not installed (required for registry authentication)"; exit 1; }
     log "SUCCESS" "podman is available"
