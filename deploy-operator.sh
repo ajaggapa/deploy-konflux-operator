@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 
 # See --operator flag for valid operators
-VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage"
+VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage ingress-node-firewall"
 
 KONFLUX_DEPLOY_OPERATORS="${KONFLUX_DEPLOY_OPERATORS:-true}"
 # Env variables to control the deployment of CatalogSource and Subscription
@@ -366,6 +366,7 @@ get_fbc_tag() {
         ptp) echo "ocp__${ver}__ose-ptp-rhel9-operator" ;;
         pfstatus) echo "ocp__${ver}__pf-status-relay-rhel9-operator" ;;
         local-storage) echo "ocp__${ver}__ose-local-storage-rhel9-operator" ;;
+        ingress-node-firewall) echo "ocp__${ver}__ingress-node-firewall-rhel9-operator" ;;
         *) echo "" ;;
     esac
 }
