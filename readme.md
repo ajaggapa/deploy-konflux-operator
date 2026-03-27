@@ -200,7 +200,7 @@ The script follows these steps when deploying an operator:
 
 | Argument | Description | Required |
 |----------|-------------|----------|
-| `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes* |
+| `--operator <name>` | Operator to deploy: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`, `ingress-node-firewall`. Supports comma-separated list: `sriov,metallb,nmstate` | Yes* |
 | `--fbc-tag <tags>` | Custom FBC image tag(s). Alternative to `--operator` for advanced usage. Supports comma-separated list for multiple tags (e.g., `ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-sriov-network-rhel9-operator`) | Yes* |
 | `--internal-registry <host:port>` | Internal registry location for **mirror mode** (enables disconnected mode with image mirroring) | No |
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
@@ -211,7 +211,7 @@ The script follows these steps when deploying an operator:
 
 **Notes:**
 - **Either** `--operator` **or** `--fbc-tag` is required (not both)
-- Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`
+- Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`, `ingress-node-firewall`
 - **Disconnected mirror mode** requires `--internal-registry` and `--internal-registry-auth` (mirrors all images)
 - **Disconnected proxy mode** requires `--internal-registry-proxy` and `--internal-registry-proxy-auth` (no mirroring, images pulled through proxy)
 - Cannot use both `--internal-registry` and `--internal-registry-proxy` simultaneously
