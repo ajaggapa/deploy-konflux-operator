@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage"
+VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage ingress-node-firewall"
 
 ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
 ART_FBC_BASE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc"
@@ -26,6 +26,7 @@ get_fbc_tag() {
         ptp) echo "ocp__${ver}__ose-ptp-rhel9-operator" ;;
         pfstatus) echo "ocp__${ver}__pf-status-relay-rhel9-operator" ;;
         local-storage) echo "ocp__${ver}__ose-local-storage-rhel9-operator" ;;
+        ingress-node-firewall) echo "ocp__${ver}__ingress-node-firewall-rhel9-operator" ;;
         *) echo "" ;;
     esac
 }
