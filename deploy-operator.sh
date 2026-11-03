@@ -902,10 +902,26 @@ if [[ "$DISCONNECTED" == true ]]; then
     log "SUCCESS" "Machine Config Pool update completed"
 fi
 
-# Disable default catalogs
+# Disable default catalogs (restored via EXIT trap only if this succeeds)
+DEFAULT_CATALOGS_DISABLED=false
+restore_default_catalogs() {
+    if [[ "$DEFAULT_CATALOGS_DISABLED" != true ]]; then
+        return 0
+    fi
+    log "INFO" "Restoring default catalogs..."
+    if oc patch operatorhub cluster -p '{"spec": {"disableAllDefaultSources": false}}' --type=merge; then
+        log "SUCCESS" "Default catalogs restored"
+        DEFAULT_CATALOGS_DISABLED=false
+    else
+        log "WARNING" "Failed to restore default catalogs"
+    fi
+}
+trap restore_default_catalogs EXIT
+
 log "INFO" "Disabling default catalogs..."
 oc patch operatorhub cluster -p '{"spec": {"disableAllDefaultSources": true}}' --type=merge || \
     { log "ERROR" "Failed to disable default catalogs"; exit 1; }
+DEFAULT_CATALOGS_DISABLED=true
 log "SUCCESS" "Default catalogs disabled"
 
 # Deploy operators
