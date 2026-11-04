@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 VALID_OPERATORS="sriov metallb nmstate ptp pfstatus local-storage ingress-node-firewall"
 
-ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
+ART_IMAGES_SOURCE="${ART_IMAGES_SOURCE:-quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share}"
 ART_FBC_BASE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc"
 
 run_and_capture() {

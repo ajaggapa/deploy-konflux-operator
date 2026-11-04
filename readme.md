@@ -220,9 +220,17 @@ The script follows these steps when deploying an operator:
 - For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
 
 **Environment Variables:**
+- `ART_IMAGES_SOURCE` - Related-image repository used as the connected IDMS mirror and the source for disconnected image mirroring. Defaults to `quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share` when unset or empty. Applies to both `deploy-operator.sh` and `deployment-dry-run.sh`; does not change the FBC repository, internal/proxy destination paths, or authentication behavior. Ensure the selected repository contains the required image digests and is accessible with your existing authentication setup.
 - `KONFLUX_DEPLOY_OPERATORS=false` - Skip all operator deployments entirely
 - `KONFLUX_DEPLOY_CATALOG_SOURCE=false` - Skip CatalogSource creation only
 - `KONFLUX_DEPLOY_SUBSCRIPTION=false` - Skip Subscription creation only (useful for deploying catalog without installing operators)
+
+Override the related-image repository for deployment or dry-run planning:
+
+```bash
+ART_IMAGES_SOURCE=registry.example.com/art-images ./deploy-operator.sh --operator sriov
+ART_IMAGES_SOURCE=registry.example.com/art-images ./deployment-dry-run.sh --operator sriov
+```
 
 
 ---
