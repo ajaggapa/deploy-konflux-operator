@@ -1,9 +1,15 @@
 # Operator Deployment Script - Usage Guide
 
-This script deploys Konflux-built operators on both **connected** and **disconnected** OpenShift clusters with metadata extracted from FBC image.
+This script deploys Konflux-built operators on **connected** and **disconnected** OpenShift clusters using metadata extracted from an FBC image.
 
 ---
+
 ## Table of Contents
+
+- [Connected Cluster Image Flow](#connected-cluster-image-flow)
+- [Disconnected Cluster Image Flow (Mirror Mode)](#disconnected-cluster-image-flow-mirror-mode)
+- [Disconnected Cluster Image Flow (Proxy Mode)](#disconnected-cluster-image-flow-proxy-mode)
+- [Existing Mirror Configuration](#existing-mirror-configuration)
 - [Prerequisites](#prerequisites)
 - [Procedure](#procedure)
 - [Arguments](#arguments)
@@ -14,164 +20,71 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 
 ## Connected Cluster Image Flow
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                          INTERNET (Quay.io)                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌──────────────────────────────────┐   ┌───────────────────────────────┐ │
-│  │  Quay FBC Repository             │   │  Quay ART Images Repository   │ │
-│  │  quay.io/.../art-fbc             │   │  quay.io/.../art-images-share │ │
-│  │                                  │   │                               │ │
-│  │  🌐 PUBLIC (no auth needed)      │   │  🔒 PRIVATE (auth required)   │ │
-│  │                                  │   │     Uses: --quay-auth         │ │
-│  │  • FBC Images (contains          │   │                               │ │
-│  │    relatedImages metadata):      │   │  • Operator Images:           │ │
-│  │    ocp__4.20__sriov-operator     │   │    @sha256:abc123...          │ │
-│  │    ocp__4.20__metallb-operator   │   │    @sha256:def456...          │ │
-│  └──────────────────────────────────┘   └───────────────────────────────┘ │
-│           │                                        │                      │
-│           │ ① Script reads                         │ ③ Cluster pulls     │
-│           │    FBC directly                        │    images directly   │
-│           │    (no mirroring)                      │    when needed       │
-│           │                                        │                      │
-└───────────┼────────────────────────────────────────┼──────────────────────┘
-            │                                        │
-            │                                        │
-            ▼                                        │
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    CONNECTED CLUSTER ENVIRONMENT                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                    OpenShift Cluster                              │  │
-│  │                                                                   │  │
-│  │  ② Script updates cluster pull-secret with --quay-auth           │  │
-│  │     credentials                                                   │  │
-│  │                                                                   │  │
-│  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │ ImageDigestMirrorSets (IDMS) - Per Operator                │   │  │
-│  │  │                                                            │   │  │
-│  │  │  sriov-art-idms:                                           │   │  │
-│  │  │    source: registry.redhat.io/openshift4/ose-sriov-*       │   │  │
-│  │  │    mirrors: quay.io/.../art-images-share                   │   │  │
-│  │  │                                                            │   │  │
-│  │  │  metallb-art-idms:                                         │   │  │
-│  │  │    source: registry.redhat.io/openshift4/metallb-*         │   │  │
-│  │  │    mirrors: quay.io/.../art-images-share                   │   │  │
-│  │  │                                                            │   │  │
-│  │  │  [... nmstate, ptp, pfstatus IDMS ...]                     │   │  │
-│  │  └────────────────────────────────────────────────────────────┘   │  │
-│  │                                │                                  │  │
-│  │                                │ ④ When pod needs image          │  │
-│  │                                ▼                                  │  │
-│  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │                  CRI-O / Image Pull Flow                   │   │  │
-│  │  │                                                            │   │  │
-│  │  │  Pod requests:                                             │   │  │
-│  │  │    registry.redhat.io/openshift4/ose-sriov@sha256:abc123   │   │  │
-│  │  │                                                            │   │  │
-│  │  │  IDMS redirects to:                                        │   │  │
-│  │  │    quay.io/.../art-images-share@sha256:abc123 ──────       ┼   ┼  ┤
-│  │  │                                                            │   │  │
-│  │  │  ✓ Image pulled from Quay.io using cluster pull-secret     │   │  │
-│  │  └────────────────────────────────────────────────────────────┘   │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+The FBC image stays at `quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc:<tag>`. Its related image references use `registry.redhat.io/<repository>@sha256:<digest>`. The script creates one IDMS for the cluster:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: stage-idms
+spec:
+  imageDigestMirrors:
+    - mirrors:
+        - registry.stage.redhat.io
+      source: registry.redhat.io
 ```
 
----
+When a pod requests a related image from `registry.redhat.io`, the IDMS directs the pull to `registry.stage.redhat.io` with the same repository path and digest. Stage pulls require registry credentials in the cluster pull-secret. Supply them with `--registry-auth` if they are not already present. The script does not copy related images in connected mode.
 
 ## Disconnected Cluster Image Flow (Mirror Mode)
 
-> **Note:** This diagram shows **mirror mode**. In **proxy mode**, steps ① and ② (mirroring FBC and related images) are skipped. Instead, the cluster pulls images directly through the registry proxy, which forwards requests to quay.io.
+With `--internal-registry`, the script copies each FBC image to `${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-fbc:<tag>`. It reads the related images from the FBC and mirrors each unique image reference from the stage registry into the same repository path in the internal registry:
 
+```text
+Original: registry.redhat.io/openshift4/ose-metallb-operator-bundle@sha256:<digest>
+Mirror source: registry.stage.redhat.io/openshift4/ose-metallb-operator-bundle@sha256:<digest>
+Mirror target: ${INTERNAL_REGISTRY}/openshift4/ose-metallb-operator-bundle
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                          INTERNET (Quay.io)                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌──────────────────────────────────┐   ┌───────────────────────────────┐ │
-│  │  Quay FBC Repository             │   │  Quay ART Images Repository   │ │
-│  │  quay.io/.../art-fbc             │   │  quay.io/.../art-images-share │ │
-│  │                                  │   │                               │ │
-│  │  🌐 PUBLIC (no auth needed)      │   │  🔒 PRIVATE (auth required)   │ │
-│  │                                  │   │     Uses: --quay-auth         │ │
-│  │  • FBC Images (contains          │   │                               │ │
-│  │    relatedImages metadata):      │   │  • Operator Images:           │ │
-│  │    ocp__4.20__sriov-operator     │   │    @sha256:abc123...          │ │
-│  │    ocp__4.20__metallb-operator   │   │    @sha256:def456...          │ │
-│  └──────────────────────────────────┘   └───────────────────────────────┘ │
-│           │                                        │                      │
-└───────────┼────────────────────────────────────────┼──────────────────────┘
-            │                                        │
-            │ ① Script pulls & mirrors              │ ② Script extracts
-            │    FBC images (5 images)               │    relatedImages from FBC
-            │                      │                 │    and mirrors ONLY those
-            │                      └─────────────────┤    (26 unique images)
-            ▼                                        ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    AIR-GAPPED ENVIRONMENT                               │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │              Internal Registry (registry.local:5000)              │  │
-│  │  /redhat-user-workloads/ocp-art-tenant/                           │  │
-│  │                                                                   │  │
-│  │  ├─ art-fbc/                      ├─ art-images-share/            │  │
-│  │  │   • ocp__4.20__sriov-operator  │   • @sha256:abc123...         │  │
-│  │  │   • ocp__4.20__metallb-op...   │   • @sha256:def456...         │  │
-│  │  │   • ocp__4.20__nmstate-op...   │   • @sha256:ghi789...         │  │
-│  │  │   • ocp__4.20__ptp-operator    │   • ... (all 26 images)       │  │
-│  │  │   • ocp__4.20__pfstatus-op...  │                               │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                │                                        │
-│                                │ ③ Script references mirrored images   │
-│                                │    when creating IDMS                  │
-│                                ▼                                        │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                    OpenShift Cluster                              │  │
-│  │                                                                   │  │
-│  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │ ImageDigestMirrorSets (IDMS) - Per Operator                │   │  │
-│  │  │                                                            │   │  │
-│  │  │  sriov-internal-idms:                                      │   │  │
-│  │  │    source: registry.redhat.io/openshift4/ose-sriov-*       │   │  │
-│  │  │    mirrors: registry.local:5000/.../art-images-share       │   │  │
-│  │  │                                                            │   │  │
-│  │  │  metallb-internal-idms:                                    │   │  │
-│  │  │    source: registry.redhat.io/openshift4/metallb-*         │   │  │
-│  │  │    mirrors: registry.local:5000/.../art-images-share       │   │  │
-│  │  │                                                            │   │  │
-│  │  │  [... nmstate, ptp, pfstatus IDMS ...]                     │   │  │
-│  │  └────────────────────────────────────────────────────────────┘   │  │
-│  │                                │                                  │  │
-│  │                                │ ④ When pod needs image          │  │
-│  │                                ▼                                  │  │
-│  │  ┌────────────────────────────────────────────────────────────┐   │  │
-│  │  │                  CRI-O / Image Pull Flow                   │   │  │
-│  │  │                                                            │   │  │
-│  │  │  Pod requests:                                             │   │  │
-│  │  │    registry.redhat.io/openshift4/ose-sriov@sha256:abc123   │   │  │
-│  │  │                                                            │   │  │
-│  │  │  IDMS redirects to:                                        │   │  │
-│  │  │    registry.local:5000/.../art-images-share@sha256:abc123  │   │  │
-│  │  │                                                            │   │  │
-│  │  │  ✓ Image pulled from internal registry                     │   │  │
-│  │  └────────────────────────────────────────────────────────────┘   │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+
+The script requires each related image reference to start with `registry.redhat.io/` and end with a SHA-256 digest. It then creates one IDMS so cluster pulls use the copied images:
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: internal-idms
+spec:
+  imageDigestMirrors:
+    - mirrors:
+        - ${INTERNAL_REGISTRY}
+      source: registry.redhat.io
 ```
+
+`--registry-auth` is required to pull the stage images, and `--internal-registry-auth` supplies credentials for the destination registry. The FBC image does not require `--registry-auth`. The script excludes any `art-images-share` credentials when merging the auth files for mirroring.
+
+## Disconnected Cluster Image Flow (Proxy Mode)
+
+With `--internal-registry-proxy`, the script does not copy images. It points the FBC image to `${INTERNAL_REGISTRY_PROXY}/redhat-user-workloads/ocp-art-tenant/art-fbc:<tag>` and creates one `internal-idms` that maps `registry.redhat.io` to `${INTERNAL_REGISTRY_PROXY}`. A related image pull therefore keeps its path and digest under the proxy host:
+
+```text
+registry.redhat.io/openshift4/ose-metallb-operator-bundle@sha256:<digest>
+  -> ${INTERNAL_REGISTRY_PROXY}/openshift4/ose-metallb-operator-bundle@sha256:<digest>
+```
+
+The proxy must serve both the Quay FBC path and the stage related image paths, including authenticated stage pulls. Its upstream routing and stage credentials are configured outside this repository; verify both before using proxy mode.
+
+## Existing Mirror Configuration
+
+The script leaves existing per-operator IDMS resources in place. Their mappings can still affect image pulls on clusters where earlier versions of the script ran. Check the effective mirror for related images before relying on the new IDMS.
+
 ---
 
 ## Prerequisites
 
 - **oc** - OpenShift CLI
 - **opm** - Operator Package Manager
-- **jq** - JSON processor  
-- **podman** - Container tool for authentication (required for disconnected mirror mode or when using --quay-auth in connected mode; not required for disconnected proxy mode)
+- **jq** - JSON processor
+- **podman** - Container tool for authentication in disconnected mirror mode
 
 ---
 
@@ -179,20 +92,15 @@ This script deploys Konflux-built operators on both **connected** and **disconne
 
 The script follows these steps when deploying an operator:
 
-1. **Authenticate to registries** - Validates Quay.io and internal registry credentials (mirror mode) or updates cluster pull-secret (proxy mode)
-2. **Mirror FBC images** (Disconnected mirror mode only) - Copies FBC images to internal registry
-3. **Extract metadata** - Reads operator details (name, namespace, channel, install mode) from FBC
-4. **Mirror related images** (Disconnected mirror mode only) - Copies all operator container images to internal registry
-5. **Update cluster pull-secret** (Connected mode or disconnected proxy mode) - Adds credentials to cluster
-6. **Configure insecure registry** (Disconnected only) - Adds internal registry or proxy to cluster configuration
-7. **Create IDMS** - Sets up image redirect rules (one per operator)
-8. **Wait for MCP update** - Waits for cluster nodes to apply new configuration (once for all operators)
-9. **Create CatalogSource** - Registers operator catalog
-10. **Create Namespace** - Creates operator namespace
-11. **Create OperatorGroup** - Configures operator deployment scope
-12. **Create Subscription** - Initiates operator installation
-13. **Wait for CSV** - Waits for ClusterServiceVersion to be created
-14. **Wait for operator pods** - Waits for all operator pods to be ready
+1. **Validate inputs and cluster access** - Checks tools, auth files, and the OpenShift version.
+2. **Authenticate** - Logs in to the internal registry in mirror mode and uses `--registry-auth` for stage pulls. In connected mode, merges supplied stage credentials into the cluster pull-secret; proxy mode merges proxy credentials.
+3. **Mirror FBC images** (disconnected mirror mode only) - Copies FBC images to the internal registry.
+4. **Extract metadata** - Reads operator details and related image references from the FBC.
+5. **Mirror related images** (disconnected mirror mode only) - Copies the stage images by digest into matching repository paths in the internal registry.
+6. **Create IDMS** - Applies one registry-level mapping to stage, the internal registry, or the proxy according to the mode.
+7. **Wait for cluster configuration** - Waits for the Machine Config Pool, configures the disconnected registry as insecure, and waits again.
+8. **Deploy operators** - Creates CatalogSources, Namespaces, OperatorGroups, and Subscriptions, then waits for CSVs and pods. The CatalogSource and Subscription steps can be disabled with environment variables.
+9. **Clean up legacy credentials** - After successful subscription deployment, removes the `art-images-share` entry from the cluster pull-secret if present.
 
 ---
 
@@ -206,17 +114,16 @@ The script follows these steps when deploying an operator:
 | `--internal-registry-auth <file>` | Auth file for internal registry (required if `--internal-registry` is set) | Conditional |
 | `--internal-registry-proxy <host:port>` | Internal registry proxy for **proxy mode** (enables disconnected mode without image mirroring) | No |
 | `--internal-registry-proxy-auth <file>` | Auth file for internal registry proxy (required if `--internal-registry-proxy` is set) | Conditional |
-| `--quay-auth <file>` | Quay.io authentication file | Conditional |
+| `--registry-auth <file>` | Stage registry auth file; required for disconnected mirror mode, or for connected mode when the cluster pull-secret lacks stage credentials | Conditional |
 | `--mcp-timeout <duration>` | Timeout duration for MachineConfigPool updates (e.g., `600s`). Default: `600s` | No |
 
 **Notes:**
 - **Either** `--operator` **or** `--fbc-tag` is required (not both)
 - Valid operators: `sriov`, `metallb`, `nmstate`, `ptp`, `pfstatus`, `local-storage`, `ingress-node-firewall`
-- **Disconnected mirror mode** requires `--internal-registry` and `--internal-registry-auth` (mirrors all images)
+- **Disconnected mirror mode** requires `--internal-registry`, `--internal-registry-auth`, and `--registry-auth` (mirrors FBC and related images)
 - **Disconnected proxy mode** requires `--internal-registry-proxy` and `--internal-registry-proxy-auth` (no mirroring, images pulled through proxy)
 - Cannot use both `--internal-registry` and `--internal-registry-proxy` simultaneously
-- `--quay-auth` is required for disconnected **mirror mode**, not needed for disconnected **proxy mode**
-- `--quay-auth` is optional for connected mode if cluster's pull-secret already contains auth for quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share repository
+- The FBC image does not need `--registry-auth`; stage related images do. In connected mode, the cluster pull-secret can already contain the stage credentials. The flag is unused in proxy mode.
 - For larger clusters, consider increasing `--mcp-timeout` if node updates take longer (e.g., `--mcp-timeout 1200s`)
 
 **Environment Variables:**
@@ -224,91 +131,55 @@ The script follows these steps when deploying an operator:
 - `KONFLUX_DEPLOY_CATALOG_SOURCE=false` - Skip CatalogSource creation only
 - `KONFLUX_DEPLOY_SUBSCRIPTION=false` - Skip Subscription creation only (useful for deploying catalog without installing operators)
 
-
 ---
 
 ## Usage
 
 ### Connected Cluster
 
-**Predefined Telco Operators:**
-```bash
-# Single operator (with quay-auth)
-./deploy-operator.sh \
-  --operator sriov \
-  --quay-auth /path/to/quay-auth.json
+The examples without `--registry-auth` assume the cluster pull-secret already contains credentials for `registry.stage.redhat.io`.
 
-# Single operator (using cluster's existing pull-secret auth)
-./deploy-operator.sh \
-  --operator sriov
+```bash
+# Single operator
+./deploy-operator.sh --operator sriov
 
 # Multiple operators
-./deploy-operator.sh \
-  --operator sriov,metallb,nmstate,ptp,pfstatus \
-  --quay-auth /path/to/quay-auth.json
-```
+./deploy-operator.sh --operator sriov,metallb,nmstate,ptp,pfstatus
 
-**Custom FBC Tag:**
-```bash
-# Single FBC tag (with quay-auth)
-./deploy-operator.sh \
-  --fbc-tag ocp__4.20__metallb-rhel9-operator \
-  --quay-auth /path/to/quay-auth.json
+# Custom FBC tag
+./deploy-operator.sh --fbc-tag ocp__4.20__metallb-rhel9-operator
 
-# Single FBC tag (using cluster's existing pull-secret auth)
+# Add stage registry credentials to the cluster pull-secret
 ./deploy-operator.sh \
-  --fbc-tag ocp__4.20__metallb-rhel9-operator
-
-# Multiple FBC tags (comma-separated)
-./deploy-operator.sh \
-  --fbc-tag ocp__4.20__metallb-rhel9-operator,ocp__4.20__ose-sriov-network-rhel9-operator \
-  --quay-auth /path/to/quay-auth.json
-```
-
-**Custom MCP Timeout (for larger clusters):**
-```bash
-./deploy-operator.sh \
-  --operator sriov,metallb \
-  --quay-auth /path/to/quay-auth.json \
-  --mcp-timeout 1200s
+  --operator sriov \
+  --registry-auth /path/to/registry-auth.json
 ```
 
 ---
 
 ### Disconnected Cluster - Mirror Mode
 
-**Predefined Telco Operators:**
 ```bash
 # Single operator
 ./deploy-operator.sh \
   --operator sriov \
   --internal-registry registry.example.com:5000 \
   --internal-registry-auth /path/to/internal-auth.json \
-  --quay-auth /path/to/quay-auth.json
+  --registry-auth /path/to/registry-auth.json
 
 # Multiple operators
 ./deploy-operator.sh \
   --operator sriov,metallb,nmstate,ptp,pfstatus \
   --internal-registry registry.example.com:5000 \
   --internal-registry-auth /path/to/internal-auth.json \
-  --quay-auth /path/to/quay-auth.json
-```
+  --registry-auth /path/to/registry-auth.json
 
-**Custom FBC Tag:**
-```bash
-# Single FBC tag
+# Custom FBC tag
 ./deploy-operator.sh \
   --fbc-tag ocp__4.21__ose-sriov-network-rhel9-operator \
   --internal-registry registry.example.com:5000 \
   --internal-registry-auth /path/to/internal-auth.json \
-  --quay-auth /path/to/quay-auth.json
-
-# Multiple FBC tags (comma-separated)
-./deploy-operator.sh \
-  --fbc-tag ocp__4.21__ose-sriov-network-rhel9-operator,ocp__4.21__metallb-rhel9-operator \
-  --internal-registry registry.example.com:5000 \
-  --internal-registry-auth /path/to/internal-auth.json \
-  --quay-auth /path/to/quay-auth.json
+  --registry-auth /path/to/registry-auth.json
 ```
 
 ---
@@ -355,7 +226,7 @@ The script follows these steps when deploying an operator:
   --operator sriov,metallb,ptp \
   --internal-registry registry.example.com:5000 \
   --internal-registry-auth /path/to/internal-auth.json \
-  --quay-auth /path/to/quay-auth.json \
+  --registry-auth /path/to/registry-auth.json \
   --mcp-timeout 20m
 ```
 
@@ -372,25 +243,17 @@ The script follows these steps when deploying an operator:
 
 ## Dry-Run Planning
 
-Use `deployment-dry-run.sh` when you want to validate the entire workflow without touching a cluster. The script reproduces the Procedure above step-by-step and prints:
-
-- Every command you would run locally (`podman login`, `oc image mirror`, `oc wait`, etc.)
-- All YAML manifests (IDMS, CatalogSource, Namespace, OperatorGroup, Subscription) wrapped in copy/paste friendly `oc apply -f -` snippets
-- Clear stage markers (`Step 1 … Step 14`) so you can follow along with the Procedure section while executing manually
-
-Because it never mutates a cluster, the dry-run script only needs minimal inputs:
+Use `deployment-dry-run.sh` to inspect the deployment plan without changing the cluster. It reads the OpenShift version with `oc` and renders FBC metadata with `opm`, so those tools and `jq` must be available. The helper prints the registry commands and resource manifests, including one registry-level IDMS. In mirror mode, it prints one command per unique related image, pulling from `registry.stage.redhat.io` into the matching internal repository path.
 
 | Argument | Description | Required |
 |----------|-------------|----------|
-| `--operator <name>` | Same operator list as the deployment script. Supports comma-separated values. | Yes* |
+| `--operator <name>` | Same operator list as the deployment script; accepts comma-separated values. | Yes* |
 | `--fbc-tag <tags>` | Custom FBC tag(s); mutually exclusive with `--operator`. | Yes* |
-| `--internal-registry <host:port>` | Treats the scenario as disconnected with image mirroring. | No |
-| `--internal-registry-proxy <host:port>` | Treats the scenario as disconnected with registry proxy (no mirroring). | No |
+| `--internal-registry <host:port>` | Plan disconnected mirror mode. | No |
+| `--internal-registry-proxy <host:port>` | Plan disconnected proxy mode. | No |
+| `--mcp-timeout <duration>` | MCP wait timeout in the printed commands. Default: `600s`. | No |
 
-Notes:
-- Provide either `--operator` or `--fbc-tag`.
-- Use either `--internal-registry` (mirror mode) or `--internal-registry-proxy` (proxy mode), not both.
-- No auth file flags are needed; the output references placeholder paths.
+Provide either `--operator` or `--fbc-tag`. The registry mode flags are mutually exclusive. Auth file paths in the printed commands are placeholders; the dry-run helper does not read auth files. Supply the corresponding `--registry-auth`, `--internal-registry-auth`, or `--internal-registry-proxy-auth` flags when running `deploy-operator.sh`.
 
 ### Dry-run Examples
 
@@ -409,6 +272,6 @@ Notes:
   --internal-registry-proxy proxy.example.com:5000
 ```
 
-Review the generated steps from top to bottom; once satisfied, rerun the same inputs with `deploy-operator.sh` to apply the changes for real.
+Review the plan, then run `deploy-operator.sh` with the same operator or FBC selection and the required auth flags for the chosen mode.
 
 ---
