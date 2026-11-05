@@ -123,9 +123,9 @@ while [[ $# -gt 0 ]]; do
             log "INFO" "Internal registry proxy auth file specified: $2"
             shift 2
             ;;
-        --quay-auth) 
-            QUAY_AUTH="$2"
-            log "INFO" "Quay auth file specified: $2"
+        --registry-auth)
+            REGISTRY_AUTH="$2"
+            log "INFO" "Additional registry auth file specified: $2"
             shift 2 
             ;;
         --mcp-timeout) 
@@ -178,9 +178,8 @@ fi
 
 log_step "CONFIG" "Determining cluster mode and validating requirements"
 
-# Check if quay-auth is required for disconnected clusters
-if [[ -n "${INTERNAL_REGISTRY:-}" && -z "${QUAY_AUTH:-}" ]]; then
-    log "ERROR" "--quay-auth is required for disconnected clusters with internal registry"
+if [[ -n "${INTERNAL_REGISTRY:-}" && -z "${REGISTRY_AUTH:-}" ]]; then
+    log "ERROR" "--registry-auth is required to pull stage images in disconnected mirror mode"
     exit 1
 fi
 
@@ -228,21 +227,21 @@ if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
     command -v "podman" >/dev/null 2>&1 || { log "ERROR" "podman not installed (required for registry authentication)"; exit 1; }
     log "SUCCESS" "podman is available"
 else
-    log "INFO" "Skipping podman check (not needed for connected clusters without quay-auth)"
+    log "INFO" "Skipping podman check (only used in disconnected mirror mode)"
 fi
 
 log "SUCCESS" "All required tools are available"
 
 log "INFO" "Validating authentication files"
 
-# Only validate quay auth file if provided
-if [[ -n "${QUAY_AUTH:-}" ]]; then
-    log "INFO" "Validating quay auth file: $QUAY_AUTH"
-    [[ ! -f "$QUAY_AUTH" ]] && { log "ERROR" "Quay auth file not found"; exit 1; }
-    jq empty "$QUAY_AUTH" 2>/dev/null || { log "ERROR" "Invalid JSON in quay auth"; exit 1; }
-    log "SUCCESS" "Quay auth file is valid"
+# Validate the optional additional registry auth file if provided.
+if [[ -n "${REGISTRY_AUTH:-}" ]]; then
+    log "INFO" "Validating additional registry auth file: $REGISTRY_AUTH"
+    [[ ! -f "$REGISTRY_AUTH" ]] && { log "ERROR" "Registry auth file not found"; exit 1; }
+    jq empty "$REGISTRY_AUTH" 2>/dev/null || { log "ERROR" "Invalid JSON in registry auth file"; exit 1; }
+    log "SUCCESS" "Additional registry auth file is valid"
 else
-    log "INFO" "No quay auth file provided"
+    log "INFO" "No additional registry auth file provided"
 fi
 
 if [[ -n "${INTERNAL_REGISTRY_AUTH:-}" ]]; then
@@ -331,7 +330,7 @@ update_cluster_pull_secret() {
 
     jq -s '
         .[0].auths as $current |
-        .[1].auths as $new |
+        (.[1].auths | with_entries(select(.key | contains("quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share") | not))) as $new |
         {
             auths: ($current + $new)
         }
@@ -571,7 +570,6 @@ EOF
 }
 
 # Set operator config
-ART_IMAGES_SOURCE="quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share"
 ART_FBC_BASE="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc"
 
 # Arrays to store operator metadata
@@ -612,45 +610,6 @@ fi
 if [[ "$DISCONNECTED" == true ]]; then
     # Authenticate to internal registry for mirroring
     if [[ "$USE_REGISTRY_PROXY" == false ]]; then
-        quay_auth_b64=""
-        quay_auth_source=""
-
-        # Priority 1: Try specific repository auth (quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share)
-        quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
-        if [[ -n "$quay_auth_key" ]]; then
-            quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
-            quay_auth_source="$quay_auth_key"
-        fi
-
-        # Priority 2: Try broader repository auth (quay.io/redhat-user-workloads)
-        if [[ -z "$quay_auth_b64" ]]; then
-            quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | contains("quay.io/redhat-user-workloads")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
-            if [[ -n "$quay_auth_key" ]]; then
-                quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
-                quay_auth_source="$quay_auth_key"
-            fi
-        fi
-
-        # Priority 3: Fall back to general quay.io domain auth
-        if [[ -z "$quay_auth_b64" ]]; then
-            quay_auth_key=$(jq -r '.auths | to_entries[] | select(.key | test("^(https://)?quay\\.io/?$")) | .key' "$QUAY_AUTH" 2>/dev/null | head -1)
-            if [[ -n "$quay_auth_key" ]]; then
-                quay_auth_b64=$(jq -r --arg key "$quay_auth_key" '.auths[$key].auth' "$QUAY_AUTH" 2>/dev/null)
-                quay_auth_source="$quay_auth_key"
-            fi
-        fi
-
-        if [[ -n "$quay_auth_b64" ]]; then
-            quay_user=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f1)
-            quay_pass=$(echo "$quay_auth_b64" | base64 -d | cut -d: -f2-)
-            echo "Authenticating to quay.io using credentials from: $quay_auth_source"
-            echo "  Username: $quay_user"
-            echo "$quay_pass" | podman login --username "$quay_user" --password-stdin quay.io >/dev/null 2>&1
-        else
-            echo "Authenticating to quay.io using authfile: $QUAY_AUTH"
-            podman login --authfile="$QUAY_AUTH" quay.io >/dev/null 2>&1
-        fi || { echo "ERROR: Failed to auth quay.io" >&2; exit 1; }
-
         internal_auth_b64=$(jq -r --arg reg "$INTERNAL_REGISTRY" '.auths[$reg].auth // empty' "$INTERNAL_REGISTRY_AUTH" 2>/dev/null)
         if [[ -n "$internal_auth_b64" ]]; then
             internal_user=$(echo "$internal_auth_b64" | base64 -d | cut -d: -f1)
@@ -664,9 +623,9 @@ if [[ "$DISCONNECTED" == true ]]; then
         update_cluster_pull_secret "$INTERNAL_REGISTRY_PROXY_AUTH"
     fi
 else
-    # Connected mode - update pull-secret with quay auth if provided
-    if [[ -n "${QUAY_AUTH:-}" ]]; then
-        update_cluster_pull_secret "$QUAY_AUTH"
+    # Connected mode - update pull-secret with optional registry auth if provided.
+    if [[ -n "${REGISTRY_AUTH:-}" ]]; then
+        update_cluster_pull_secret "$REGISTRY_AUTH"
     fi
 fi
 
@@ -760,9 +719,9 @@ echo "============================================================"
 
 # Mirror all related images if disconnected and not using proxy
 if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
-    # Merge quay and internal auth files for oc image mirror (pull+push)
+    # Merge stage registry credentials for the pull with internal registry credentials for the push.
     MERGED_AUTH_FILE=$(mktemp)
-    jq -s '{auths: (.[0].auths + .[1].auths)}' "$QUAY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
+    jq -s '{auths: ((.[0].auths | with_entries(select(.key | contains("quay.io/redhat-user-workloads/ocp-art-tenant/art-images-share") | not))) + .[1].auths)}' "$REGISTRY_AUTH" "$INTERNAL_REGISTRY_AUTH" > "$MERGED_AUTH_FILE" || \
         { echo "ERROR: Failed to merge auth files for image mirroring" >&2; rm -f "$MERGED_AUTH_FILE" "$ALL_IMAGES_FILE"; exit 1; }
 
     # Sort unique images to a new file (avoids pipefail issues with process substitution)
@@ -773,26 +732,27 @@ if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
     echo "Mirroring related images..."
     image_count=0
 
-    # Read directly from the sorted file
-    set +e  # Temporarily disable exit on error for the loop
+    # Read directly from the sorted file.
     while IFS= read -r image; do
         [[ -z "$image" ]] && continue
 
-        digest=$(echo "$image" | grep -o 'sha256:[a-f0-9]\{64\}')
-        [[ -z "$digest" ]] && continue
+        if [[ ! "$image" =~ ^registry\.redhat\.io/([^@]+)@sha256:([a-f0-9]{64})$ ]]; then
+            echo "ERROR: Expected a registry.redhat.io related image with a sha256 digest: $image" >&2
+            rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
+            exit 1
+        fi
 
-        ((image_count++))
-        echo "  [$image_count/$total_images] Mirroring $digest..."
-        source="${ART_IMAGES_SOURCE}@${digest}"
-        target="${INTERNAL_REGISTRY}/redhat-user-workloads/ocp-art-tenant/art-images-share"
+        image_count=$((image_count + 1))
+        image_path="${BASH_REMATCH[1]}"
+        digest="sha256:${BASH_REMATCH[2]}"
+        source="registry.stage.redhat.io/${image#registry.redhat.io/}"
+        target="${INTERNAL_REGISTRY}/${image_path%:*}"
+        echo "  [$image_count/$total_images] Mirroring $source to $target..."
 
-        mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1)
-        mirror_status=$?
-        if [[ $mirror_status -eq 0 ]]; then
+        if mirror_output=$(oc image mirror --keep-manifest-list=true -a "$MERGED_AUTH_FILE" "$source" "$target" </dev/null 2>&1); then
             echo "    ✓ Success"
         else
-            set -e  # Re-enable exit on error
-            echo "ERROR: Failed to mirror $digest" >&2
+            echo "ERROR: Failed to mirror $source" >&2
             echo "Source: $source" >&2
             echo "Target: $target" >&2
             echo "Digest: $digest" >&2
@@ -802,7 +762,6 @@ if [[ "$DISCONNECTED" == true && "$USE_REGISTRY_PROXY" == false ]]; then
             exit 1
         fi
     done < "$SORTED_IMAGES_FILE"
-    set -e  # Re-enable exit on error
 
     echo "Successfully mirrored all $image_count images"
     rm -f "$MERGED_AUTH_FILE" "$SORTED_IMAGES_FILE"
@@ -810,73 +769,30 @@ else
     rm -f "$ALL_IMAGES_FILE"
 fi
 
-# Create IDMS
-log_step "IDMS" "Creating Image Digest Mirror Sets (IDMS)"
-
-# Create separate IDMS for each deployment key
-log "INFO" "Generating IDMS for each operator/FBC tag"
+# Create one registry-level IDMS for all related images.
+log_step "IDMS" "Creating Image Digest Mirror Set (IDMS)"
 
 if [[ "$DISCONNECTED" == true ]]; then
-    mirror_registry="${INTERNAL_REGISTRY:-}"
-    if [[ "$USE_REGISTRY_PROXY" == true ]]; then
-        mirror_registry="${INTERNAL_REGISTRY_PROXY}"
-    fi
-    IDMS_MIRROR="${mirror_registry}/redhat-user-workloads/ocp-art-tenant/art-images-share"
-    IDMS_SUFFIX="internal-idms"
+    # Preserve repository paths so the internal registry can serve every image.
+    IDMS_MIRROR="${INTERNAL_REGISTRY:-$INTERNAL_REGISTRY_PROXY}"
+    IDMS_NAME="internal-idms"
 else
-    IDMS_MIRROR="${ART_IMAGES_SOURCE}"
-    IDMS_SUFFIX="art-idms"
+    IDMS_MIRROR="registry.stage.redhat.io"
+    IDMS_NAME="stage-idms"
 fi
 
-# Store IDMS YAMLs in temp files
-declare -A OPERATOR_IDMS_FILES
-
-# Loop 1: Generate all IDMS YAMLs
-for op in "${DEPLOYMENT_KEYS[@]}"; do
-    fbc_source="${OPERATOR_FBC_SOURCES[$op]}"
-    # Sanitize the deployment key for use in IDMS name
-    sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
-    idms_name="${sanitized_key}-${IDMS_SUFFIX}"
-
-    echo "  Generating IDMS: $idms_name"
-
-    # Re-render FBC to get bundle data for this operator
-    opm_output=$(opm render "$fbc_source" 2>/dev/null) || { echo "ERROR: opm render failed for $op" >&2; exit 1; }
-    latest_bundle=$(echo "$opm_output" | jq -r 'select(.schema == "olm.bundle") | .name' | sort -V | tail -1)
-    bundle_data=$(echo "$opm_output" | jq "select(.schema == \"olm.bundle\" and .name == \"$latest_bundle\")")
-
-    # Create temp file for this IDMS
-    idms_file=$(mktemp)
-    OPERATOR_IDMS_FILES[$op]="$idms_file"
-
-    {
-        echo "apiVersion: config.openshift.io/v1
+log "INFO" "Applying IDMS: $IDMS_NAME"
+oc apply -f - <<EOF || { log "ERROR" "IDMS apply failed"; exit 1; }
+apiVersion: config.openshift.io/v1
 kind: ImageDigestMirrorSet
 metadata:
-  name: ${idms_name}
+  name: ${IDMS_NAME}
 spec:
-  imageDigestMirrors:"
-        while IFS= read -r repo; do
-            [[ -z "$repo" ]] && continue
-            echo "  - mirrors:
-    - ${IDMS_MIRROR}
-    source: $repo"
-        done < <(echo "$bundle_data" | jq -r '.relatedImages[]?.image // empty' | grep -v '^$' | sed 's/@sha256:[a-f0-9]\{64\}$//' | sort -u)
-    } > "$idms_file"
-done
-    
-# Loop 2: Apply all IDMS YAMLs to cluster
-echo ""
-echo "Applying all IDMS to cluster..."
-for op in "${DEPLOYMENT_KEYS[@]}"; do
-    idms_file="${OPERATOR_IDMS_FILES[$op]}"
-    # Sanitize the deployment key for use in IDMS name
-    sanitized_key=$(echo "$op" | tr ':' '-' | tr '/' '-' | tr '_' '-')
-    idms_name="${sanitized_key}-${IDMS_SUFFIX}"
-    echo "  Applying IDMS: $idms_name"
-    oc apply -f "$idms_file" || { echo "ERROR: IDMS apply failed for $op" >&2; exit 1; }
-    rm -f "$idms_file"
-done
+  imageDigestMirrors:
+    - mirrors:
+        - ${IDMS_MIRROR}
+      source: registry.redhat.io
+EOF
 
 log "INFO" "Waiting for Machine Config Pool update after IDMS creation..."
 oc wait --for=condition=Updating mcp --all --timeout=60s >/dev/null 2>&1 || true
@@ -990,4 +906,3 @@ if [[ ${#FAILED_OPERATORS[@]} -gt 0 ]]; then
 else
     log "SUCCESS" "All operators deployed successfully!"
 fi
-
